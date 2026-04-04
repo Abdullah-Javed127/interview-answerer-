@@ -1,0 +1,5 @@
+groq>=0.31.0
+numpy>=1.26.0,<2.3
+sounddevice>=0.4.7
+soundcard>=0.4.5
+soundfile>=0.12.1

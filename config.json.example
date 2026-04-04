@@ -1,0 +1,13 @@
+{
+  "groq_api_key": "paste_your_groq_api_key_here",
+  "job_title": "Senior Python Developer",
+  "company_name": "Example Company",
+  "resume_summary": "7+ years building Python backend systems, APIs, cloud deployments, and mentoring teams.",
+  "output_mode": "virtual_cable",
+  "input_mode": "system_audio",
+  "loopback_device_contains": "",
+  "tts_voice": "troy",
+  "tts_speed": 1.0,
+  "silence_timeout_sec": 1.8,
+  "vad_threshold": 0.012
+}

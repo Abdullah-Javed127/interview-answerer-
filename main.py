@@ -1,0 +1,1412 @@
+import io
+import json
+import logging
+import queue
+import random
+import threading
+import time
+import ctypes
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+import tkinter as tk
+from groq import Groq
+from tkinter import messagebox, scrolledtext, ttk
+
+try:
+    import soundcard as sc
+except Exception:  # pragma: no cover - optional import at runtime
+    sc = None
+
+
+LOG_FORMAT = "[%(asctime)s] %(levelname)s: %(message)s"
+logging.basicConfig(level=logging.INFO, format=LOG_FORMAT)
+logger = logging.getLogger("interview-agent")
+
+
+CONFIG_PATH = Path("config.json")
+FRAME_DURATION_SEC = 0.2
+SAMPLE_RATE = 16000
+CHANNELS = 1
+SILENCE_TIMEOUT_DEFAULT = 1.8
+VAD_THRESHOLD_DEFAULT = 0.005
+MIN_QUESTION_SECONDS = 0.8
+MAX_QUESTION_SECONDS = 25.0
+MAX_HISTORY_MESSAGES = 8
+INTERRUPT_CONSECUTIVE_FRAMES = 3
+PREEMPT_CONSECUTIVE_FRAMES = 3
+OUTPUT_CHUNK_SAMPLES = 1024
+ANSWER_MAX_TOKENS = 240
+ANSWER_MAX_WORDS = 170
+ANSWER_MAX_CHARS = 980
+TTS_RETRY_MAX_WORDS = 90
+TTS_RETRY_MAX_CHARS = 560
+
+# ── Robust VAD constants ──
+# For 200ms frames at 16kHz = 3200 samples:
+#   Speech ZCR: ~100-800 crossings (depends on pitch and harmonics)
+#   Fan/hiss noise: ~1500+ crossings (broadband)
+VAD_ZCR_MIN = 15            # Reject near-DC rumble (very few crossings)
+VAD_ZCR_MAX = 1200          # Reject broadband hiss/noise (very many crossings)
+VAD_SPEECH_BAND_HZ = (250, 3800)  # Human speech frequency band
+VAD_SPEECH_ENERGY_RATIO_MIN = 0.20  # Min fraction of energy in speech band
+NOISE_FLOOR_ALPHA = 0.05  # EMA smoothing for adaptive noise floor
+NOISE_FLOOR_MULTIPLIER = 3.0  # Effective threshold = noise_floor * this
+NOISE_FLOOR_INITIAL = 0.005  # Initial noise floor estimate
+NOISE_FLOOR_MAX = 0.08  # Cap the noise floor so it doesn't adapt to speech
+
+# ── Whisper hallucination guard ──
+WHISPER_HALLUCINATION_BLOCKLIST = {
+    "thank you.", "thanks for watching.", "thanks for watching!",
+    "thank you for watching.", "thank you for watching!",
+    "please subscribe.", "subscribe.", "silence.", "music.",
+    "bye.", "bye!", "you.", "okay.", "so.", "yeah.",
+    "the end.", "...", "hmm.", "uh.", "um.",
+    "thanks for listening.", "thanks for listening!",
+    "see you next time.", "see you next time!",
+    "like and subscribe.", "please like and subscribe.",
+    "subtitles by the amara.org community",
+}
+WHISPER_MIN_WORDS = 3
+WHISPER_NO_SPEECH_PROB_MAX = 0.6
+WHISPER_AVG_LOGPROB_MIN = -1.0
+
+# ── Filler clips ──
+FILLER_PHRASES = [
+    "Oh, uh,",
+    "Mm, right,",
+    "Ah, sure,",
+    "Um,",
+    "Oh, okay,",
+]
+
+
+def compute_zcr(chunk: np.ndarray) -> int:
+    """Count zero-crossings in an audio chunk — voice has moderate ZCR, noise is very high."""
+    signs = np.signbit(chunk)
+    crossings = int(np.sum(np.abs(np.diff(signs.astype(np.int8)))))
+    return crossings
+
+
+def compute_speech_band_energy_ratio(chunk: np.ndarray, sample_rate: int) -> float:
+    """Fraction of spectral energy in the human speech band (250-3800 Hz) vs full spectrum."""
+    n = len(chunk)
+    if n < 16:
+        return 0.0
+    spectrum = np.abs(np.fft.rfft(chunk))
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    total_energy = float(np.sum(spectrum ** 2)) + 1e-12
+    lo, hi = VAD_SPEECH_BAND_HZ
+    mask = (freqs >= lo) & (freqs <= hi)
+    speech_energy = float(np.sum(spectrum[mask] ** 2))
+    return speech_energy / total_energy
+
+
+def is_voice_frame(
+    chunk: np.ndarray,
+    rms: float,
+    effective_threshold: float,
+    sample_rate: int = SAMPLE_RATE,
+) -> bool:
+    """Multi-signal voice activity detection: RMS + ZCR + spectral energy ratio.
+
+    Returns True only if all three signals suggest human speech, not noise.
+    """
+    if rms < effective_threshold:
+        return False
+
+    zcr = compute_zcr(chunk)
+    if zcr < VAD_ZCR_MIN or zcr > VAD_ZCR_MAX:
+        logger.debug("VAD rejected: ZCR=%d (range %d-%d), rms=%.4f", zcr, VAD_ZCR_MIN, VAD_ZCR_MAX, rms)
+        return False
+
+    ratio = compute_speech_band_energy_ratio(chunk, sample_rate)
+    if ratio < VAD_SPEECH_ENERGY_RATIO_MIN:
+        logger.debug("VAD rejected: spectral_ratio=%.3f (min %.3f), rms=%.4f", ratio, VAD_SPEECH_ENERGY_RATIO_MIN, rms)
+        return False
+
+    logger.debug("VAD accepted: rms=%.4f zcr=%d ratio=%.3f", rms, zcr, ratio)
+    return True
+
+
+def is_whisper_hallucination(text: str, transcription_obj: Any = None) -> bool:
+    """Check if a Whisper transcription is likely a hallucination (noise/silence artifact)."""
+    cleaned = text.strip().lower()
+    if not cleaned:
+        return True
+
+    # Blocklist check
+    if cleaned in WHISPER_HALLUCINATION_BLOCKLIST:
+        logger.info("Whisper hallucination blocked (blocklist): %r", text)
+        return True
+
+    # Too few words
+    word_count = len(cleaned.split())
+    if word_count < WHISPER_MIN_WORDS:
+        logger.info("Whisper hallucination blocked (only %d words): %r", word_count, text)
+        return True
+
+    # Confidence check from verbose_json segments
+    if transcription_obj is not None:
+        segments = getattr(transcription_obj, "segments", None)
+        if segments and len(segments) > 0:
+            avg_no_speech = sum(
+                s.get("no_speech_prob", 0) if isinstance(s, dict) else getattr(s, "no_speech_prob", 0)
+                for s in segments
+            ) / len(segments)
+            avg_logprob = sum(
+                s.get("avg_logprob", 0) if isinstance(s, dict) else getattr(s, "avg_logprob", 0)
+                for s in segments
+            ) / len(segments)
+            if avg_no_speech > WHISPER_NO_SPEECH_PROB_MAX:
+                logger.info(
+                    "Whisper hallucination blocked (no_speech_prob=%.2f): %r",
+                    avg_no_speech, text
+                )
+                return True
+            if avg_logprob < WHISPER_AVG_LOGPROB_MIN:
+                logger.info(
+                    "Whisper hallucination blocked (avg_logprob=%.2f): %r",
+                    avg_logprob, text
+                )
+                return True
+
+    return False
+
+
+@dataclass
+class AppConfig:
+    groq_api_key: str
+    job_title: str
+    company_name: str
+    resume_summary: str
+    output_mode: str
+    input_mode: str = "system_audio"
+    loopback_device_contains: str = ""
+    tts_voice: str = "troy"
+    tts_speed: float = 1.0
+    silence_timeout_sec: float = SILENCE_TIMEOUT_DEFAULT
+    vad_threshold: float = VAD_THRESHOLD_DEFAULT
+    input_device_name: str = ""   # Empty = auto-detect / default
+    output_device_name: str = ""  # Empty = auto-detect / default
+
+
+def enumerate_audio_devices() -> Dict[str, List[Tuple[int, str]]]:
+    """Return dict with 'input' and 'output' lists of (device_index, device_name)."""
+    devices = sd.query_devices()
+    inputs: List[Tuple[int, str]] = []
+    outputs: List[Tuple[int, str]] = []
+    for idx, dev in enumerate(devices):
+        name = str(dev.get("name", f"Device {idx}"))
+        if dev.get("max_input_channels", 0) >= 1:
+            inputs.append((idx, name))
+        if dev.get("max_output_channels", 0) >= 1:
+            outputs.append((idx, name))
+    return {"input": inputs, "output": outputs}
+
+
+def default_config_raw() -> Dict[str, Any]:
+    return {
+        "groq_api_key": "",
+        "job_title": "Senior Python Developer",
+        "company_name": "Example Company",
+        "resume_summary": "7+ years building Python backend systems, APIs, cloud deployments, and mentoring teams.",
+        "output_mode": "virtual_cable",
+        "input_mode": "system_audio",
+        "loopback_device_contains": "",
+        "tts_voice": "troy",
+        "tts_speed": 1.0,
+        "silence_timeout_sec": SILENCE_TIMEOUT_DEFAULT,
+        "vad_threshold": VAD_THRESHOLD_DEFAULT,
+        "input_device_name": "",
+        "output_device_name": "",
+    }
+
+
+def load_config_raw(path: Path) -> Dict[str, Any]:
+    raw = default_config_raw()
+    if not path.exists():
+        return raw
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            loaded = json.load(f)
+    except Exception:
+        return raw
+    if isinstance(loaded, dict):
+        raw.update(loaded)
+    return raw
+
+
+def build_config(raw: Dict[str, Any], require_required: bool = True) -> AppConfig:
+    required_fields = ["groq_api_key", "job_title", "company_name", "resume_summary"]
+    if require_required:
+        missing = [key for key in required_fields if not str(raw.get(key, "")).strip()]
+        if missing:
+            raise ValueError(f"Missing required fields: {', '.join(missing)}")
+
+    output_mode = str(raw.get("output_mode", "virtual_cable")).strip().lower()
+    if output_mode not in {"virtual_cable", "speakers"}:
+        raise ValueError('output_mode must be either "virtual_cable" or "speakers".')
+
+    input_mode = str(raw.get("input_mode", "system_audio")).strip().lower()
+    if input_mode not in {"microphone", "system_audio"}:
+        raise ValueError('input_mode must be either "microphone" or "system_audio".')
+
+    try:
+        speed = float(raw.get("tts_speed", 1.0))
+    except Exception as exc:
+        raise ValueError("tts_speed must be a number.") from exc
+    if speed <= 0:
+        raise ValueError("tts_speed must be > 0.")
+
+    try:
+        silence_timeout = float(raw.get("silence_timeout_sec", SILENCE_TIMEOUT_DEFAULT))
+    except Exception as exc:
+        raise ValueError("silence_timeout_sec must be a number.") from exc
+    if silence_timeout < 1.2 or silence_timeout > 4.0:
+        raise ValueError("silence_timeout_sec should be between 1.2 and 4.0 seconds.")
+
+    try:
+        vad_threshold = float(raw.get("vad_threshold", VAD_THRESHOLD_DEFAULT))
+    except Exception as exc:
+        raise ValueError("vad_threshold must be a number.") from exc
+    if vad_threshold <= 0:
+        raise ValueError("vad_threshold must be > 0.")
+
+    return AppConfig(
+        groq_api_key=str(raw.get("groq_api_key", "")).strip(),
+        job_title=str(raw.get("job_title", "")).strip(),
+        company_name=str(raw.get("company_name", "")).strip(),
+        resume_summary=str(raw.get("resume_summary", "")).strip(),
+        output_mode=output_mode,
+        input_mode=input_mode,
+        loopback_device_contains=str(raw.get("loopback_device_contains", "")).strip(),
+        tts_voice=str(raw.get("tts_voice", "troy")).strip() or "troy",
+        tts_speed=speed,
+        silence_timeout_sec=silence_timeout,
+        vad_threshold=vad_threshold,
+        input_device_name=str(raw.get("input_device_name", "")).strip(),
+        output_device_name=str(raw.get("output_device_name", "")).strip(),
+    )
+
+
+def save_config(cfg: AppConfig, path: Path) -> None:
+    raw = {
+        "groq_api_key": cfg.groq_api_key,
+        "job_title": cfg.job_title,
+        "company_name": cfg.company_name,
+        "resume_summary": cfg.resume_summary,
+        "output_mode": cfg.output_mode,
+        "input_mode": cfg.input_mode,
+        "loopback_device_contains": cfg.loopback_device_contains,
+        "tts_voice": cfg.tts_voice,
+        "tts_speed": cfg.tts_speed,
+        "silence_timeout_sec": cfg.silence_timeout_sec,
+        "vad_threshold": cfg.vad_threshold,
+        "input_device_name": cfg.input_device_name,
+        "output_device_name": cfg.output_device_name,
+    }
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(raw, f, indent=2)
+
+
+def build_system_prompt(cfg: AppConfig) -> str:
+    template = (
+        "You are a highly professional, confident, and experienced candidate interviewing "
+        "for [JOB_TITLE] at [COMPANY_NAME].\n"
+        "You have this background: [RESUME_SUMMARY].\n"
+        "Critical behavior rules:\n"
+        "1) Interruption awareness: if the interviewer starts speaking while you are answering, "
+        "immediately stop your current answer and switch to the new input.\n"
+        "2) Prioritization: latest interviewer input always overrides your current response. "
+        "Never continue the old response unless explicitly asked.\n"
+        "3) Conversational flow: answer naturally like a human with concise 30-90 second responses. "
+        "Slight pauses and small corrections are okay; do not sound scripted.\n"
+        "4) Memory consistency: stay consistent with prior claims in this interview context. "
+        "Do not contradict earlier answers. Do not invent conflicting experiences.\n"
+        "5) Context handling: if interrupted mid-answer, do not resume the old answer unless asked.\n"
+        "6) Clarity over completion: if a question is cut off or unclear, politely ask for clarification.\n"
+        "Use STAR structure for behavioral questions when useful, but keep it tight. "
+        "Never mention you are AI."
+    )
+    return (
+        template.replace("[JOB_TITLE]", cfg.job_title)
+        .replace("[COMPANY_NAME]", cfg.company_name)
+        .replace("[RESUME_SUMMARY]", cfg.resume_summary)
+    )
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    status_code = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    return status_code == 429 or "rate limit" in text or "too many requests" in text
+
+
+def is_tts_payload_too_large_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        "413" in text
+        or "payload too large" in text
+        or "request too large" in text
+        or "tokens per minute" in text
+    )
+
+
+class InterviewUI:
+    def __init__(self, on_start, on_stop, on_exit, initial_raw: Dict[str, Any]):
+        self.root = tk.Tk()
+        self.root.title("Groq Interview Voice Agent")
+        self.root.geometry("900x700")
+        self.root.minsize(820, 640)
+        self.root.protocol("WM_DELETE_WINDOW", on_exit)
+        self.status_var = tk.StringVar(value="Ready")
+        self.output_mode_var = tk.StringVar(
+            value=str(initial_raw.get("output_mode", "virtual_cable")).strip().lower()
+            or "virtual_cable"
+        )
+        self.input_mode_var = tk.StringVar(
+            value=str(initial_raw.get("input_mode", "system_audio")).strip().lower()
+            or "system_audio"
+        )
+        self.input_device_var = tk.StringVar(
+            value=str(initial_raw.get("input_device_name", "")).strip() or "Auto-detect"
+        )
+        self.output_device_var = tk.StringVar(
+            value=str(initial_raw.get("output_device_name", "")).strip() or "Auto-detect"
+        )
+        self.form_widgets: List[Any] = []
+
+        # Enumerate available devices for dropdowns
+        try:
+            dev_map = enumerate_audio_devices()
+            self._input_device_names = ["Auto-detect"] + [name for _, name in dev_map["input"]]
+            self._output_device_names = ["Auto-detect"] + [name for _, name in dev_map["output"]]
+        except Exception:
+            self._input_device_names = ["Auto-detect"]
+            self._output_device_names = ["Auto-detect"]
+
+        shell = ttk.Frame(self.root, padding=10)
+        shell.pack(fill="both", expand=True)
+
+        ttk.Label(
+            shell,
+            text="Groq Voice Interview Agent",
+            font=("Segoe UI", 14, "bold"),
+        ).pack(anchor="w")
+
+        top_row = ttk.Frame(shell)
+        top_row.pack(fill="x", pady=(8, 8))
+        ttk.Label(top_row, text="Status:", font=("Segoe UI", 10, "bold")).pack(side="left")
+        ttk.Label(top_row, textvariable=self.status_var).pack(side="left", padx=6)
+        self.start_button = ttk.Button(top_row, text="Start Interview", command=on_start)
+        self.start_button.pack(side="right", padx=(8, 0))
+        self.stop_button = ttk.Button(top_row, text="Stop", command=on_stop, state="disabled")
+        self.stop_button.pack(side="right")
+
+        setup = ttk.LabelFrame(shell, text="Interview Setup", padding=10)
+        setup.pack(fill="x")
+        setup.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(setup, text="Groq API Key").grid(row=row, column=0, sticky="w", pady=4)
+        self.api_key_entry = ttk.Entry(setup, show="*")
+        self.api_key_entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=4)
+        self.api_key_entry.insert(0, str(initial_raw.get("groq_api_key", "")))
+        self.form_widgets.append(self.api_key_entry)
+
+        row += 1
+        ttk.Label(setup, text="Job Title").grid(row=row, column=0, sticky="w", pady=4)
+        self.job_title_entry = ttk.Entry(setup)
+        self.job_title_entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=4)
+        self.job_title_entry.insert(0, str(initial_raw.get("job_title", "")))
+        self.form_widgets.append(self.job_title_entry)
+
+        row += 1
+        ttk.Label(setup, text="Company").grid(row=row, column=0, sticky="w", pady=4)
+        self.company_entry = ttk.Entry(setup)
+        self.company_entry.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=4)
+        self.company_entry.insert(0, str(initial_raw.get("company_name", "")))
+        self.form_widgets.append(self.company_entry)
+
+        row += 1
+        ttk.Label(setup, text="TTS Speed").grid(row=row, column=0, sticky="w", pady=4)
+        self.tts_speed_entry = ttk.Entry(setup, width=12)
+        self.tts_speed_entry.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+        self.tts_speed_entry.insert(0, str(initial_raw.get("tts_speed", 1.0)))
+        self.form_widgets.append(self.tts_speed_entry)
+
+        row += 1
+        ttk.Label(setup, text="Output").grid(row=row, column=0, sticky="w", pady=4)
+        self.output_mode_combo = ttk.Combobox(
+            setup,
+            values=["virtual_cable", "speakers"],
+            textvariable=self.output_mode_var,
+            state="readonly",
+            width=20,
+        )
+        self.output_mode_combo.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+        self.form_widgets.append(self.output_mode_combo)
+
+        row += 1
+        ttk.Label(setup, text="Input Mode").grid(row=row, column=0, sticky="w", pady=4)
+        self.input_mode_combo = ttk.Combobox(
+            setup,
+            values=["microphone", "system_audio"],
+            textvariable=self.input_mode_var,
+            state="readonly",
+            width=20,
+        )
+        self.input_mode_combo.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+        self.form_widgets.append(self.input_mode_combo)
+
+        row += 1
+        ttk.Label(setup, text="Input Device").grid(row=row, column=0, sticky="w", pady=4)
+        self.input_device_combo = ttk.Combobox(
+            setup,
+            values=self._input_device_names,
+            textvariable=self.input_device_var,
+            state="readonly",
+            width=40,
+        )
+        self.input_device_combo.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+        self.form_widgets.append(self.input_device_combo)
+
+        row += 1
+        ttk.Label(setup, text="Output Device").grid(row=row, column=0, sticky="w", pady=4)
+        self.output_device_combo = ttk.Combobox(
+            setup,
+            values=self._output_device_names,
+            textvariable=self.output_device_var,
+            state="readonly",
+            width=40,
+        )
+        self.output_device_combo.grid(row=row, column=1, sticky="w", padx=(8, 0), pady=4)
+        self.form_widgets.append(self.output_device_combo)
+
+        row += 1
+        ttk.Label(setup, text="Resume Summary").grid(
+            row=row, column=0, sticky="nw", pady=(8, 4)
+        )
+        self.resume_text = scrolledtext.ScrolledText(setup, height=6, wrap=tk.WORD)
+        self.resume_text.grid(row=row, column=1, sticky="ew", padx=(8, 0), pady=(8, 4))
+        self.resume_text.insert(tk.END, str(initial_raw.get("resume_summary", "")))
+        self.form_widgets.append(self.resume_text)
+
+        tips = ttk.Frame(shell)
+        tips.pack(fill="x", pady=(8, 4))
+        ttk.Label(
+            tips,
+            text="Select your audio devices above, or leave as Auto-detect for defaults.",
+        ).pack(anchor="w")
+        ttk.Label(
+            tips,
+            text="If VB-Cable is not installed, output will auto-fallback to speakers.",
+        ).pack(anchor="w")
+
+        body = ttk.Frame(shell, padding=(0, 8, 0, 0))
+        body.pack(fill="both", expand=True)
+        ttk.Label(body, text="Live Activity", font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        self.log_box = scrolledtext.ScrolledText(
+            body, height=12, wrap=tk.WORD, font=("Consolas", 10)
+        )
+        self.log_box.pack(fill="both", expand=True, pady=(4, 0))
+        self.log_box.configure(state="disabled")
+
+    def get_config_raw(self) -> Dict[str, Any]:
+        input_dev = self.input_device_var.get().strip()
+        output_dev = self.output_device_var.get().strip()
+        return {
+            "groq_api_key": self.api_key_entry.get().strip(),
+            "job_title": self.job_title_entry.get().strip(),
+            "company_name": self.company_entry.get().strip(),
+            "resume_summary": self.resume_text.get("1.0", tk.END).strip(),
+            "output_mode": self.output_mode_var.get().strip().lower(),
+            "input_mode": self.input_mode_var.get().strip().lower() or "system_audio",
+            "loopback_device_contains": "",
+            "tts_voice": "troy",
+            "tts_speed": self.tts_speed_entry.get().strip() or "1.0",
+            "silence_timeout_sec": SILENCE_TIMEOUT_DEFAULT,
+            "vad_threshold": VAD_THRESHOLD_DEFAULT,
+            "input_device_name": "" if input_dev == "Auto-detect" else input_dev,
+            "output_device_name": "" if output_dev == "Auto-detect" else output_dev,
+        }
+
+    def set_running(self, is_running: bool) -> None:
+        self.start_button.configure(state="disabled" if is_running else "normal")
+        self.stop_button.configure(state="normal" if is_running else "disabled")
+        for widget in self.form_widgets:
+            target_state = "disabled" if is_running else "normal"
+            if isinstance(widget, ttk.Combobox):
+                target_state = "disabled" if is_running else "readonly"
+            widget.configure(state=target_state)
+
+    def set_status(self, text: str) -> None:
+        self.status_var.set(text)
+
+    def append_log(self, line: str) -> None:
+        self.log_box.configure(state="normal")
+        self.log_box.insert(tk.END, f"{line}\n")
+        self.log_box.see(tk.END)
+        self.log_box.configure(state="disabled")
+
+    def show_error(self, title: str, text: str) -> None:
+        messagebox.showerror(title, text)
+
+
+class InterviewAgent:
+    def __init__(self, cfg: AppConfig, ui: InterviewUI):
+        self.cfg = cfg
+        self.ui = ui
+        self.client = Groq(api_key=cfg.groq_api_key, timeout=20.0, max_retries=1)
+        self.system_prompt = build_system_prompt(cfg)
+        self.stop_event = threading.Event()
+        self.audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=120)
+        self.ui_queue: "queue.Queue[Tuple[str, str]]" = queue.Queue()
+        self.stream: Optional[sd.InputStream] = None
+        self.capture_thread: Optional[threading.Thread] = None
+        self.worker_thread: Optional[threading.Thread] = None
+        self.history: List[Dict[str, str]] = []
+        self.memory_summary: str = ""
+        self.turn_count = 0
+        self.processing_lock = threading.Lock()
+        self.frame_samples = int(SAMPLE_RATE * FRAME_DURATION_SEC)
+        self.output_device = self._select_output_device()
+        self.input_device, self.loopback_speaker_name, self.input_source_label = (
+            self._select_input_source()
+        )
+        self.capture_own_output_risk = (
+            self.cfg.input_mode == "system_audio" and self.output_device is None
+        )
+        self.is_speaking = threading.Event()
+        self.turn_in_progress = threading.Event()
+        self.interrupt_requested = threading.Event()
+        self.interrupt_voice_frames = 0
+        self.preempt_requested = threading.Event()
+        self.preempt_voice_frames = 0
+        self.last_response_interrupted = False
+
+        # ── Adaptive noise floor ──
+        self.noise_floor = NOISE_FLOOR_INITIAL
+        self._noise_floor_lock = threading.Lock()
+
+        # ── Pre-generated filler clips (populated on start) ──
+        self.filler_clips: List[bytes] = []
+        self._filler_generation_done = threading.Event()
+
+    def _can_detect_interruptions(self) -> bool:
+        if self.cfg.input_mode == "microphone":
+            return True
+        # In system-audio mode this is safe when output is not routed to default speakers.
+        return self.cfg.input_mode == "system_audio" and not self.capture_own_output_risk
+
+    def _select_input_source(self) -> Tuple[Optional[int], Any, str]:
+        if self.cfg.input_mode == "microphone":
+            # If user selected a specific input device by name, resolve its index
+            if self.cfg.input_device_name:
+                devices = sd.query_devices()
+                for idx, dev in enumerate(devices):
+                    if dev.get("max_input_channels", 0) >= 1 and dev.get("name") == self.cfg.input_device_name:
+                        label = f'microphone: "{dev["name"]}"'
+                        self._emit_ui("log", f"Input device selected: {label}")
+                        return idx, None, label
+                self._emit_ui("log", f'Configured input device "{self.cfg.input_device_name}" not found. Using default.')
+            return None, None, "microphone (fallback mode, default input device)"
+
+        if sc is None:
+            raise RuntimeError(
+                "System audio capture backend is missing. Run install.bat to install requirements."
+            )
+
+        # If user selected a specific loopback source by name, use it
+        if self.cfg.input_device_name:
+            try:
+                mics = sc.all_microphones(include_loopback=True)
+                for mic in mics:
+                    if self.cfg.input_device_name in str(mic.name):
+                        label = f'system audio loopback from "{mic.name}" (user-selected)'
+                        self._emit_ui("log", f"Input source: {label}")
+                        return None, str(mic.name), label
+            except Exception:
+                pass
+            self._emit_ui("log", f'Configured input device "{self.cfg.input_device_name}" not found for loopback. Using default.')
+
+        try:
+            speaker = sc.default_speaker()
+        except Exception as exc:
+            raise RuntimeError(f"Could not get default speaker for loopback capture: {exc}") from exc
+        if speaker is None:
+            raise RuntimeError("No default speaker found for system audio capture.")
+
+        label = f'system audio loopback from "{speaker.name}"'
+        return None, str(speaker.name), label
+
+    def _update_noise_floor(self, rms: float) -> None:
+        """Update the adaptive noise floor using an exponential moving average.
+        Only updates when we are NOT speaking and NOT processing a turn."""
+        if self.is_speaking.is_set() or self.turn_in_progress.is_set():
+            return
+        with self._noise_floor_lock:
+            self.noise_floor = (
+                NOISE_FLOOR_ALPHA * rms + (1 - NOISE_FLOOR_ALPHA) * self.noise_floor
+            )
+            self.noise_floor = min(self.noise_floor, NOISE_FLOOR_MAX)
+
+    def _get_effective_threshold(self) -> float:
+        """Dynamic VAD threshold: max of configured threshold and adaptive noise floor * multiplier."""
+        with self._noise_floor_lock:
+            adaptive = self.noise_floor * NOISE_FLOOR_MULTIPLIER
+        return max(self.cfg.vad_threshold, adaptive)
+
+    def _ingest_input_chunk(self, chunk: np.ndarray) -> None:
+        if self.stop_event.is_set():
+            return
+        if chunk.size == 0:
+            return
+        chunk = np.asarray(chunk, dtype=np.float32)
+        rms = float(np.sqrt(np.mean(np.square(chunk))) + 1e-12)
+        effective_threshold = self._get_effective_threshold()
+        can_detect_interruptions = self._can_detect_interruptions()
+
+        # Update noise floor during quiet periods
+        voiced = is_voice_frame(chunk, rms, effective_threshold)
+        if not voiced:
+            self._update_noise_floor(rms)
+
+        if self.turn_in_progress.is_set() and not self.is_speaking.is_set() and can_detect_interruptions:
+            if is_voice_frame(chunk, rms, effective_threshold):
+                self.preempt_voice_frames += 1
+                if self.preempt_voice_frames >= PREEMPT_CONSECUTIVE_FRAMES:
+                    self.preempt_requested.set()
+            else:
+                self.preempt_voice_frames = max(0, self.preempt_voice_frames - 1)
+        elif not self.turn_in_progress.is_set():
+            self.preempt_voice_frames = 0
+
+        # In system-audio mode, when output goes to default speakers, loopback captures our
+        # own TTS. Drop input while speaking to prevent self-transcription loops.
+        if self.is_speaking.is_set() and self.capture_own_output_risk:
+            return
+
+        if self.is_speaking.is_set() and can_detect_interruptions:
+            if is_voice_frame(chunk, rms, effective_threshold):
+                self.interrupt_voice_frames += 1
+                if self.interrupt_voice_frames >= INTERRUPT_CONSECUTIVE_FRAMES:
+                    self.interrupt_requested.set()
+            else:
+                self.interrupt_voice_frames = max(0, self.interrupt_voice_frames - 1)
+        try:
+            self.audio_queue.put_nowait(chunk)
+        except queue.Full:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self.audio_queue.put_nowait(chunk)
+            except queue.Full:
+                logger.debug("Audio queue still full; dropping newest chunk.")
+
+    def _system_audio_capture_worker(self) -> None:
+        if not self.loopback_speaker_name:
+            return
+        com_initialized = False
+        try:
+            # soundcard uses COM internally on Windows; initialize COM in this worker thread.
+            hr = ctypes.windll.ole32.CoInitializeEx(None, 0x2)
+            # RPC_E_CHANGED_MODE means COM is already initialized with another model.
+            if hr not in (0, 1, -2147417850):
+                raise RuntimeError(f"COM init failed (HRESULT=0x{hr & 0xFFFFFFFF:08x}).")
+            com_initialized = hr in (0, 1)
+
+            loopback_recorder = sc.get_microphone(
+                id=self.loopback_speaker_name, include_loopback=True
+            )
+            with loopback_recorder.recorder(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                blocksize=self.frame_samples,
+            ) as recorder:
+                while not self.stop_event.is_set():
+                    data = recorder.record(numframes=self.frame_samples)
+                    if data is None:
+                        continue
+                    if getattr(data, "ndim", 1) > 1:
+                        chunk = data[:, 0]
+                    else:
+                        chunk = data
+                    self._ingest_input_chunk(chunk)
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "binary mode of fromstring is removed" in msg or "use frombuffer instead" in msg:
+                self._emit_ui(
+                    "log",
+                    (
+                        "System audio capture dependency mismatch detected (SoundCard vs NumPy). "
+                        "Please run install.bat to reinstall pinned dependencies."
+                    ),
+                )
+            self._emit_ui("log", f"System audio capture stopped: {exc}")
+            self._emit_ui("status", "Stopped")
+            self.stop_event.set()
+        finally:
+            if com_initialized:
+                try:
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    logger.debug("COM uninitialize warning", exc_info=True)
+
+    def _select_output_device(self) -> Optional[int]:
+        # If user explicitly selected an output device by name, use it
+        if self.cfg.output_device_name:
+            devices = sd.query_devices()
+            for idx, dev in enumerate(devices):
+                if dev.get("max_output_channels", 0) >= 1 and dev.get("name") == self.cfg.output_device_name:
+                    self._emit_ui("log", f'Output device selected: "{dev["name"]}".')
+                    return idx
+            self._emit_ui("log", f'Configured output device "{self.cfg.output_device_name}" not found. Falling back to auto-detect.')
+
+        if self.cfg.output_mode == "speakers":
+            self._emit_ui("log", "Output mode: speakers (default output device).")
+            return None
+
+        devices = sd.query_devices()
+        candidates = []
+        for idx, dev in enumerate(devices):
+            if dev.get("max_output_channels", 0) < 1:
+                continue
+            name = str(dev.get("name", "")).lower()
+            if "cable input" in name or "vb-audio" in name or "virtual cable" in name:
+                candidates.append((idx, dev.get("name", "")))
+
+        if candidates:
+            idx, name = candidates[0]
+            self._emit_ui("log", f'Output mode: virtual_cable (using "{name}").')
+            return idx
+
+        self._emit_ui(
+            "log",
+            "Virtual cable requested but no VB-Cable output device found. Falling back to speakers.",
+        )
+        return None
+
+    def _emit_ui(self, kind: str, text: str) -> None:
+        self.ui_queue.put((kind, text))
+        if kind == "log":
+            logger.info(text)
+
+    def _audio_callback(self, indata, frames, _time_info, status) -> None:
+        if status:
+            logger.warning("Audio callback status: %s", status)
+        chunk = indata[:, 0].copy()
+        self._ingest_input_chunk(chunk)
+
+    def _generate_filler_clips_background(self) -> None:
+        """Pre-generate short filler audio clips via Groq TTS in a background thread."""
+        clips = []
+        for phrase in FILLER_PHRASES:
+            if self.stop_event.is_set():
+                break
+            try:
+                response = self.client.audio.speech.create(
+                    model="canopylabs/orpheus-v1-english",
+                    voice=self.cfg.tts_voice,
+                    input=phrase,
+                    response_format="wav",
+                    speed=1.0,
+                )
+                if hasattr(response, "read"):
+                    audio_bytes = response.read()
+                elif hasattr(response, "content"):
+                    audio_bytes = response.content
+                else:
+                    continue
+                if audio_bytes:
+                    clips.append(audio_bytes)
+            except Exception as exc:
+                logger.debug("Filler clip generation failed for %r: %s", phrase, exc)
+                # If rate-limited, stop trying more fillers
+                if is_rate_limit_error(exc):
+                    break
+                continue
+        self.filler_clips = clips
+        self._filler_generation_done.set()
+        if clips:
+            self._emit_ui("log", f"Pre-generated {len(clips)} interrupt filler clips.")
+        else:
+            self._emit_ui("log", "Could not generate filler clips (will skip on interrupt).")
+
+    def _play_interrupt_filler(self) -> None:
+        """Play a random short filler clip on interrupt to sound natural."""
+        if not self.filler_clips:
+            return
+        clip = random.choice(self.filler_clips)
+        try:
+            self._play_raw_audio(clip)
+        except Exception as exc:
+            logger.debug("Filler playback failed: %s", exc)
+
+    def _play_raw_audio(self, audio_bytes: bytes) -> None:
+        """Play audio bytes without interrupt detection (used for short fillers)."""
+        data, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+        playback_data = data if data.ndim == 1 else data[:, 0]
+        if playback_data.size == 0:
+            return
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            device=self.output_device,
+            blocksize=OUTPUT_CHUNK_SAMPLES,
+        )
+        try:
+            stream.start()
+            cursor = 0
+            total = playback_data.shape[0]
+            while cursor < total and not self.stop_event.is_set():
+                end = min(cursor + OUTPUT_CHUNK_SAMPLES, total)
+                chunk = playback_data[cursor:end]
+                if chunk.shape[0] < OUTPUT_CHUNK_SAMPLES:
+                    chunk = np.pad(chunk, (0, OUTPUT_CHUNK_SAMPLES - chunk.shape[0]))
+                stream.write(chunk.reshape(-1, 1))
+                cursor = end
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                pass
+
+    def start(self) -> None:
+        self._emit_ui("status", "Listening...")
+        self._emit_ui("log", f"Input mode: {self.cfg.input_mode}, output mode: {self.cfg.output_mode}")
+        self._emit_ui("log", f"Default loopback speaker: {self.loopback_speaker_name or 'n/a'}")
+        self._emit_ui(
+            "log",
+            f"Selected output device: {self.output_device if self.output_device is not None else 'default speakers'}",
+        )
+        if self.capture_own_output_risk:
+            self._emit_ui(
+                "log",
+                "Speaker loopback risk detected; input is muted while TTS plays to prevent self-interruption.",
+            )
+        self.worker_thread = threading.Thread(target=self._audio_worker, daemon=True)
+        self.worker_thread.start()
+
+        # Pre-generate filler clips in background (non-blocking)
+        filler_thread = threading.Thread(
+            target=self._generate_filler_clips_background, daemon=True
+        )
+        filler_thread.start()
+
+        if self.cfg.input_mode == "system_audio":
+            self.capture_thread = threading.Thread(
+                target=self._system_audio_capture_worker,
+                daemon=True,
+            )
+            self.capture_thread.start()
+        else:
+            self.stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                blocksize=self.frame_samples,
+                dtype="float32",
+                device=self.input_device,
+                callback=self._audio_callback,
+            )
+            self.stream.start()
+        self._emit_ui(
+            "log",
+            f"Input stream started ({self.input_source_label}) at {SAMPLE_RATE} Hz. Waiting for interviewer question...",
+        )
+
+    def stop(self) -> None:
+        if self.stop_event.is_set():
+            return
+        self.stop_event.set()
+        self._emit_ui("status", "Stopping...")
+        try:
+            if self.stream is not None:
+                self.stream.stop()
+                self.stream.close()
+        except Exception:
+            logger.exception("Error while closing audio stream.")
+        finally:
+            self.stream = None
+
+        if self.capture_thread and self.capture_thread.is_alive():
+            self.capture_thread.join(timeout=2.0)
+        self.capture_thread = None
+
+        if self.worker_thread and self.worker_thread.is_alive():
+            self.worker_thread.join(timeout=2.0)
+
+    def _audio_worker(self) -> None:
+        speaking = False
+        silence_sec = 0.0
+        speech_chunks: List[np.ndarray] = []
+        speech_sec = 0.0
+
+        while not self.stop_event.is_set():
+            try:
+                chunk = self.audio_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            rms = float(np.sqrt(np.mean(np.square(chunk))) + 1e-12)
+            effective_threshold = self._get_effective_threshold()
+            voiced = is_voice_frame(chunk, rms, effective_threshold)
+
+            if voiced:
+                if not speaking:
+                    speaking = True
+                    speech_chunks = []
+                    speech_sec = 0.0
+                    silence_sec = 0.0
+                    self._emit_ui("status", "Listening... (speech detected)")
+                speech_chunks.append(chunk)
+                speech_sec += FRAME_DURATION_SEC
+                silence_sec = 0.0
+                if speech_sec >= MAX_QUESTION_SECONDS:
+                    self._handle_detected_question(speech_chunks)
+                    speaking = False
+                    speech_chunks = []
+                    speech_sec = 0.0
+                    silence_sec = 0.0
+                continue
+
+            if speaking:
+                speech_chunks.append(chunk)
+                speech_sec += FRAME_DURATION_SEC
+                silence_sec += FRAME_DURATION_SEC
+                if silence_sec >= self.cfg.silence_timeout_sec:
+                    if speech_sec >= MIN_QUESTION_SECONDS:
+                        self._handle_detected_question(speech_chunks)
+                    speaking = False
+                    speech_chunks = []
+                    speech_sec = 0.0
+                    silence_sec = 0.0
+                    self._emit_ui("status", "Listening...")
+
+    def _handle_detected_question(self, chunks: List[np.ndarray]) -> None:
+        with self.processing_lock:
+            preserve_audio_queue = False
+            try:
+                if self.stop_event.is_set():
+                    return
+                self.last_response_interrupted = False
+                self.turn_in_progress.set()
+                self.preempt_requested.clear()
+                self.preempt_voice_frames = 0
+                waveform = np.concatenate(chunks).astype(np.float32)
+                if waveform.size < int(SAMPLE_RATE * MIN_QUESTION_SECONDS):
+                    return
+
+                self._emit_ui("status", "Transcribing question...")
+                try:
+                    question = self._transcribe_audio(waveform)
+                except Exception as exc:
+                    self._emit_api_error("Transcription failed", exc)
+                    return
+                if self.stop_event.is_set():
+                    return
+
+                if not question:
+                    self._emit_ui("log", "No clear question detected. Continuing to listen.")
+                    return
+                if self.preempt_requested.is_set():
+                    preserve_audio_queue = True
+                    self._emit_ui(
+                        "log",
+                        "New interviewer speech detected. Dropping pending answer and prioritizing latest input.",
+                    )
+                    self._emit_ui("status", "Listening...")
+                    return
+
+                self._emit_ui("log", f"Question heard: {question}")
+                self._emit_ui("status", "Generating answer...")
+
+                try:
+                    answer = self._generate_answer(question)
+                except Exception as exc:
+                    self._emit_api_error("Answer generation failed", exc)
+                    return
+                if self.stop_event.is_set():
+                    return
+                if self.preempt_requested.is_set():
+                    preserve_audio_queue = True
+                    self._emit_ui(
+                        "log",
+                        "New interviewer speech detected. Dropping pending answer and prioritizing latest input.",
+                    )
+                    self._emit_ui("status", "Listening...")
+                    return
+
+                if not answer:
+                    self._emit_ui("log", "LLM returned empty answer. Skipping response.")
+                    return
+
+                self._emit_ui("log", f"Answering: {answer}")
+                self._emit_ui("status", "Speaking answer...")
+
+                try:
+                    tts_bytes = self._text_to_speech(answer)
+                    if self.preempt_requested.is_set():
+                        preserve_audio_queue = True
+                        self._emit_ui(
+                            "log",
+                            "New interviewer speech detected during TTS prep. Prioritizing latest input.",
+                        )
+                        self._emit_ui("status", "Listening...")
+                        return
+                    interrupted = self._play_audio_bytes(tts_bytes)
+                    if interrupted:
+                        preserve_audio_queue = True
+                        self._play_interrupt_filler()
+                        self._emit_ui(
+                            "log",
+                            "Interviewer interruption detected. Played filler and listening now...",
+                        )
+                        self.last_response_interrupted = True
+                    else:
+                        self._record_turn(question, answer)
+                except Exception as exc:
+                    self._emit_api_error("Speech playback failed", exc)
+                    return
+
+                self._emit_ui("status", "Listening...")
+            finally:
+                self.turn_in_progress.clear()
+                self.preempt_requested.clear()
+                self.preempt_voice_frames = 0
+                if not self.last_response_interrupted and not preserve_audio_queue:
+                    self._clear_audio_queue()
+
+    def _transcribe_audio(self, waveform: np.ndarray) -> str:
+        wav_buffer = io.BytesIO()
+        sf.write(wav_buffer, waveform, SAMPLE_RATE, format="WAV", subtype="PCM_16")
+        wav_buffer.seek(0)
+        file_tuple = ("question.wav", wav_buffer.read(), "audio/wav")
+
+        transcription = self.client.audio.transcriptions.create(
+            model="whisper-large-v3-turbo",
+            file=file_tuple,
+            language="en",
+            response_format="verbose_json",
+            temperature=0.0,
+        )
+
+        text = getattr(transcription, "text", "") or ""
+        text = text.strip()
+
+        # ── Whisper hallucination guard ──
+        if is_whisper_hallucination(text, transcription):
+            self._emit_ui("log", f"Filtered likely hallucination: {text!r}")
+            return ""
+
+        return text
+
+    def _compact_tts_text(self, text: str, max_words: int, max_chars: int) -> str:
+        cleaned = " ".join(str(text).replace("\n", " ").replace("\r", " ").split())
+        if not cleaned:
+            return ""
+        words = cleaned.split()
+        if len(words) > max_words:
+            cleaned = " ".join(words[:max_words]).rstrip(" ,.;:")
+        if len(cleaned) > max_chars:
+            cleaned = cleaned[:max_chars].rstrip(" ,.;:")
+        if cleaned and cleaned[-1] not in ".!?":
+            cleaned = f"{cleaned}."
+        return cleaned
+
+    def _generate_answer(self, question: str) -> str:
+        messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
+        if self.memory_summary:
+            messages.append(
+                {
+                    "role": "system",
+                    "content": (
+                        "Conversation memory (high-priority consistency context):\n"
+                        f"{self.memory_summary}"
+                    ),
+                }
+            )
+        messages.extend(self.history[-MAX_HISTORY_MESSAGES:])
+        messages.append({"role": "user", "content": question})
+
+        completion = self.client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.55,
+            max_tokens=ANSWER_MAX_TOKENS,
+        )
+
+        answer = completion.choices[0].message.content or ""
+        answer = self._compact_tts_text(answer, ANSWER_MAX_WORDS, ANSWER_MAX_CHARS)
+        return answer
+
+    def _record_turn(self, question: str, answer: str) -> None:
+        self.history.append({"role": "user", "content": question})
+        self.history.append({"role": "assistant", "content": answer})
+        self.turn_count += 1
+        if len(self.history) > MAX_HISTORY_MESSAGES:
+            self.history = self.history[-MAX_HISTORY_MESSAGES:]
+        if self.turn_count % 2 == 0:
+            self._refresh_memory_summary()
+
+    def _refresh_memory_summary(self) -> None:
+        if len(self.history) < 2:
+            return
+        try:
+            completion = self.client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                temperature=0.2,
+                max_tokens=170,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "Summarize interview context in compact bullet points for memory. "
+                            "Include: claims about experience, projects, strengths, weaknesses, "
+                            "leadership examples, and any facts that should stay consistent. "
+                            "Do not include fluff."
+                        ),
+                    },
+                    {
+                        "role": "user",
+                        "content": json.dumps(self.history[-8:], ensure_ascii=True),
+                    },
+                ],
+            )
+            summary = (completion.choices[0].message.content or "").strip()
+            if summary:
+                self.memory_summary = summary
+        except Exception as exc:
+            logger.debug("Memory summary refresh failed: %s", exc)
+
+    def _text_to_speech(self, text: str) -> bytes:
+        # Orpheus currently expects speed=1.0 in most deployments.
+        speed = self.cfg.tts_speed
+        speech_text = self._compact_tts_text(text, ANSWER_MAX_WORDS, ANSWER_MAX_CHARS)
+        if not speech_text:
+            raise RuntimeError("No text available for TTS after compaction.")
+
+        if abs(speed - 1.0) > 1e-6:
+            self._emit_ui(
+                "log",
+                "Note: Current Orpheus API may only support speed=1.0. Falling back automatically if needed.",
+            )
+
+        try:
+            response = self.client.audio.speech.create(
+                model="canopylabs/orpheus-v1-english",
+                voice=self.cfg.tts_voice,
+                input=speech_text,
+                response_format="wav",
+                speed=speed,
+            )
+        except Exception as exc:
+            if is_tts_payload_too_large_error(exc):
+                shorter_text = self._compact_tts_text(
+                    speech_text, TTS_RETRY_MAX_WORDS, TTS_RETRY_MAX_CHARS
+                )
+                self._emit_ui("log", "TTS payload too large; retrying with shorter answer.")
+                response = self.client.audio.speech.create(
+                    model="canopylabs/orpheus-v1-english",
+                    voice=self.cfg.tts_voice,
+                    input=shorter_text,
+                    response_format="wav",
+                    speed=1.0,
+                )
+            # If speed is rejected by API, retry at 1.0 for reliability.
+            elif abs(speed - 1.0) > 1e-6:
+                self._emit_ui("log", f"TTS speed rejected by API ({exc}); retrying at 1.0.")
+                response = self.client.audio.speech.create(
+                    model="canopylabs/orpheus-v1-english",
+                    voice=self.cfg.tts_voice,
+                    input=speech_text,
+                    response_format="wav",
+                    speed=1.0,
+                )
+            else:
+                raise
+
+        if hasattr(response, "read"):
+            audio_bytes = response.read()
+        elif hasattr(response, "content"):
+            audio_bytes = response.content
+        else:
+            raise RuntimeError("Unexpected TTS response type from Groq SDK.")
+
+        if not audio_bytes:
+            raise RuntimeError("Groq TTS returned empty audio.")
+
+        return audio_bytes
+
+    def _play_audio_bytes(self, audio_bytes: bytes) -> bool:
+        data, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
+        playback_data = data if data.ndim == 1 else data[:, 0]
+        if playback_data.size == 0:
+            return False
+
+        self.interrupt_requested.clear()
+        self.interrupt_voice_frames = 0
+        self.is_speaking.set()
+
+        interrupted = False
+        stream = sd.OutputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            device=self.output_device,
+            blocksize=OUTPUT_CHUNK_SAMPLES,
+        )
+        try:
+            stream.start()
+            cursor = 0
+            total = playback_data.shape[0]
+            while cursor < total and not self.stop_event.is_set():
+                if self.interrupt_requested.is_set():
+                    interrupted = True
+                    break
+                end = min(cursor + OUTPUT_CHUNK_SAMPLES, total)
+                chunk = playback_data[cursor:end]
+                if chunk.shape[0] < OUTPUT_CHUNK_SAMPLES:
+                    chunk = np.pad(chunk, (0, OUTPUT_CHUNK_SAMPLES - chunk.shape[0]))
+                stream.write(chunk.reshape(-1, 1))
+                cursor = end
+        finally:
+            try:
+                stream.stop()
+                stream.close()
+            except Exception:
+                logger.debug("Output stream close warning", exc_info=True)
+            self.is_speaking.clear()
+            self.interrupt_requested.clear()
+            self.interrupt_voice_frames = 0
+
+        return interrupted
+
+    def _emit_api_error(self, context: str, exc: Exception) -> None:
+        if is_rate_limit_error(exc):
+            msg = f"{context}: Rate limit reached - wait a bit and retry."
+        else:
+            msg = f"{context}: {exc}"
+        self._emit_ui("log", msg)
+        self._emit_ui("log", traceback.format_exc().strip())
+        self._emit_ui("status", "Listening...")
+        if not self.preempt_requested.is_set():
+            self._clear_audio_queue()
+        logger.exception("%s", context)
+
+    def _clear_audio_queue(self) -> None:
+        while True:
+            try:
+                self.audio_queue.get_nowait()
+            except queue.Empty:
+                break
+
+
+def run_app() -> None:
+    # Basic sanity check before opening UI.
+    try:
+        sd.query_devices()
+    except Exception as exc:
+        print(f"Audio device error: {exc}")
+        return
+
+    initial_raw = load_config_raw(CONFIG_PATH)
+    agent_ref: Dict[str, Optional[InterviewAgent]] = {"agent": None}
+
+    def on_start() -> None:
+        if agent_ref["agent"] is not None:
+            return
+
+        try:
+            cfg = build_config(ui.get_config_raw(), require_required=True)
+        except Exception as exc:
+            ui.show_error("Invalid Setup", str(exc))
+            return
+
+        try:
+            save_config(cfg, CONFIG_PATH)
+        except Exception as exc:
+            ui.show_error("Save Failed", f"Could not save config.json: {exc}")
+            return
+
+        ui.append_log("Saved setup to config.json.")
+        ui.append_log("Starting interview agent...")
+        ui.set_status("Starting...")
+
+        agent: Optional[InterviewAgent] = None
+        try:
+            agent = InterviewAgent(cfg=cfg, ui=ui)
+            agent_ref["agent"] = agent
+            ui.set_running(True)
+            agent.start()
+        except Exception as exc:
+            logger.exception("Failed to start agent")
+            if agent is not None:
+                try:
+                    agent.stop()
+                except Exception:
+                    logger.debug("Agent cleanup failed after startup error.", exc_info=True)
+            agent_ref["agent"] = None
+            ui.set_running(False)
+            ui.set_status("Ready")
+            ui.show_error("Startup Error", str(exc))
+
+    def on_stop() -> None:
+        agent = agent_ref["agent"]
+        if agent is None:
+            return
+        agent.stop()
+        agent_ref["agent"] = None
+        ui.set_running(False)
+        ui.set_status("Stopped")
+        ui.append_log("Agent stopped.")
+
+    def on_exit() -> None:
+        on_stop()
+        ui.root.after(100, ui.root.destroy)
+
+    ui = InterviewUI(
+        on_start=on_start,
+        on_stop=on_stop,
+        on_exit=on_exit,
+        initial_raw=initial_raw,
+    )
+    ui.append_log("Ready. Fill setup and click Start Interview.")
+    ui.append_log("Input capture is system audio from your default playback device.")
+    ui.append_log("No mic setup required.")
+
+    def pump_ui_queue() -> None:
+        agent = agent_ref["agent"]
+        if agent is not None:
+            while True:
+                try:
+                    kind, text = agent.ui_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if kind == "status":
+                    ui.set_status(text)
+                elif kind == "log":
+                    ui.append_log(text)
+                    print(text, flush=True)
+            if agent.stop_event.is_set():
+                agent_ref["agent"] = None
+                ui.set_running(False)
+                if ui.status_var.get() != "Stopped":
+                    ui.set_status("Ready")
+        ui.root.after(100, pump_ui_queue)
+
+    ui.root.after(100, pump_ui_queue)
+    ui.root.mainloop()
+
+
+if __name__ == "__main__":
+    run_app()
