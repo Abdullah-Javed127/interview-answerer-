@@ -7,6 +7,7 @@ import threading
 import time
 import ctypes
 import traceback
+from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -38,14 +39,25 @@ VAD_THRESHOLD_DEFAULT = 0.005
 MIN_QUESTION_SECONDS = 0.8
 MAX_QUESTION_SECONDS = 25.0
 MAX_HISTORY_MESSAGES = 8
-INTERRUPT_CONSECUTIVE_FRAMES = 3
+MAX_PROMPT_RECENT_MESSAGES = 4
+INTERRUPT_CONSECUTIVE_FRAMES = 2
 PREEMPT_CONSECUTIVE_FRAMES = 3
 OUTPUT_CHUNK_SAMPLES = 1024
-ANSWER_MAX_TOKENS = 240
+ANSWER_MAX_TOKENS = 190
 ANSWER_MAX_WORDS = 170
 ANSWER_MAX_CHARS = 980
 TTS_RETRY_MAX_WORDS = 90
 TTS_RETRY_MAX_CHARS = 560
+INTERRUPT_PREROLL_FRAMES = 5
+INTERRUPT_MIN_QUESTION_SECONDS = 0.25
+MEMORY_SUMMARY_MAX_CHARS = 700
+MODEL_HISTORY_TEXT_MAX_CHARS = 320
+
+# ── Interrupt mic VAD ──
+# Simpler, more sensitive threshold for mic-based interrupt detection.
+# This uses RMS-only (no ZCR/spectral) since we just need to know
+# "is someone speaking?" not "is this clean speech?"
+INTERRUPT_MIC_RMS_THRESHOLD = 0.01
 
 # ── Robust VAD constants ──
 # For 200ms frames at 16kHz = 3200 samples:
@@ -132,6 +144,17 @@ def is_voice_frame(
 
     logger.debug("VAD accepted: rms=%.4f zcr=%d ratio=%.3f", rms, zcr, ratio)
     return True
+
+
+def is_voice_frame_simple(chunk: np.ndarray, rms_threshold: float = INTERRUPT_MIC_RMS_THRESHOLD) -> bool:
+    """Simplified voice detection using only RMS energy.
+
+    Used for interrupt detection via microphone where the audio may be
+    compressed/processed (video call audio through speakers) and may not
+    pass the stricter ZCR/spectral checks.
+    """
+    rms = float(np.sqrt(np.mean(np.square(chunk))) + 1e-12)
+    return rms > rms_threshold
 
 
 def is_whisper_hallucination(text: str, transcription_obj: Any = None) -> bool:
@@ -317,22 +340,15 @@ def save_config(cfg: AppConfig, path: Path) -> None:
 
 def build_system_prompt(cfg: AppConfig) -> str:
     template = (
-        "You are a highly professional, confident, and experienced candidate interviewing "
-        "for [JOB_TITLE] at [COMPANY_NAME].\n"
-        "You have this background: [RESUME_SUMMARY].\n"
-        "Critical behavior rules:\n"
-        "1) Interruption awareness: if the interviewer starts speaking while you are answering, "
-        "immediately stop your current answer and switch to the new input.\n"
-        "2) Prioritization: latest interviewer input always overrides your current response. "
-        "Never continue the old response unless explicitly asked.\n"
-        "3) Conversational flow: answer naturally like a human with concise 30-90 second responses. "
-        "Slight pauses and small corrections are okay; do not sound scripted.\n"
-        "4) Memory consistency: stay consistent with prior claims in this interview context. "
-        "Do not contradict earlier answers. Do not invent conflicting experiences.\n"
-        "5) Context handling: if interrupted mid-answer, do not resume the old answer unless asked.\n"
-        "6) Clarity over completion: if a question is cut off or unclear, politely ask for clarification.\n"
-        "Use STAR structure for behavioral questions when useful, but keep it tight. "
-        "Never mention you are AI."
+        "You are interviewing for [JOB_TITLE] at [COMPANY_NAME]. "
+        "Background: [RESUME_SUMMARY].\n"
+        "Answer like a real candidate on a live call.\n"
+        "- Be concise: usually 1 to 4 sentences.\n"
+        "- Be natural and direct, not formal or robotic.\n"
+        "- Continue the existing conversation consistently.\n"
+        "- If the prior answer ended with [INTERRUPTED], recover naturally.\n"
+        "- After the opening hello, skip pleasantries and answer immediately.\n"
+        "- Never say you are an AI."
     )
     return (
         template.replace("[JOB_TITLE]", cfg.job_title)
@@ -355,6 +371,29 @@ def is_tts_payload_too_large_error(exc: Exception) -> bool:
         or "request too large" in text
         or "tokens per minute" in text
     )
+
+
+def compact_model_text(text: str, max_chars: int = MODEL_HISTORY_TEXT_MAX_CHARS) -> str:
+    cleaned = " ".join(str(text).replace("\n", " ").replace("\r", " ").split())
+    if len(cleaned) <= max_chars:
+        return cleaned
+    shortened = cleaned[:max_chars].rstrip(" ,.;:")
+    last_sentence_break = max(shortened.rfind(". "), shortened.rfind("? "), shortened.rfind("! "))
+    if last_sentence_break >= max_chars // 2:
+        shortened = shortened[: last_sentence_break + 1]
+    return shortened
+
+
+def format_history_for_memory(history_items: List[Dict[str, str]]) -> str:
+    lines: List[str] = []
+    for item in history_items:
+        role = item.get("role", "")
+        content = compact_model_text(item.get("content", ""))
+        if not content:
+            continue
+        speaker = "Interviewer" if role == "user" else "Candidate"
+        lines.append(f"{speaker}: {content}")
+    return "\n".join(lines)
 
 
 class InterviewUI:
@@ -570,10 +609,14 @@ class InterviewAgent:
         self.stream: Optional[sd.InputStream] = None
         self.capture_thread: Optional[threading.Thread] = None
         self.worker_thread: Optional[threading.Thread] = None
+        self.response_thread: Optional[threading.Thread] = None
         self.history: List[Dict[str, str]] = []
         self.memory_summary: str = ""
         self.turn_count = 0
         self.processing_lock = threading.Lock()
+        self.history_lock = threading.Lock()
+        self.turn_lock = threading.Lock()
+        self.active_response_workers = 0
         self.frame_samples = int(SAMPLE_RATE * FRAME_DURATION_SEC)
         self.output_device = self._select_output_device()
         self.input_device, self.loopback_speaker_name, self.input_source_label = (
@@ -589,6 +632,11 @@ class InterviewAgent:
         self.preempt_requested = threading.Event()
         self.preempt_voice_frames = 0
         self.last_response_interrupted = False
+        self.current_turn_id = 0
+        self.interrupt_preroll: deque[np.ndarray] = deque(maxlen=INTERRUPT_PREROLL_FRAMES)
+        self.interrupt_buffer_chunks: List[np.ndarray] = []
+        self.pending_priority_chunks: List[np.ndarray] = []
+        self._pending_priority_lock = threading.Lock()
 
         # ── Adaptive noise floor ──
         self.noise_floor = NOISE_FLOOR_INITIAL
@@ -598,10 +646,25 @@ class InterviewAgent:
         self.filler_clips: List[bytes] = []
         self._filler_generation_done = threading.Event()
 
+        # ── Secondary microphone stream for interrupt detection ──
+        # When input_mode is system_audio with capture_own_output_risk,
+        # the system audio loopback captures the bot's own TTS output,
+        # so we can't use it for interrupt detection. Instead, we open
+        # a separate microphone stream that only listens during TTS
+        # playback to detect when the interviewer is speaking.
+        self._mic_interrupt_stream: Optional[sd.InputStream] = None
+        self._mic_interrupt_available = False
+        self._mic_interrupt_voice_frames = 0
+
     def _can_detect_interruptions(self) -> bool:
+        """Always return True — we use the secondary mic for interrupt
+        detection when system audio has capture_own_output_risk."""
         if self.cfg.input_mode == "microphone":
             return True
-        # In system-audio mode this is safe when output is not routed to default speakers.
+        # When we have a mic interrupt stream, we can always detect.
+        if self._mic_interrupt_available:
+            return True
+        # Fallback: only safe when output is not routed to default speakers.
         return self.cfg.input_mode == "system_audio" and not self.capture_own_output_risk
 
     def _select_input_source(self) -> Tuple[Optional[int], Any, str]:
@@ -662,6 +725,137 @@ class InterviewAgent:
             adaptive = self.noise_floor * NOISE_FLOOR_MULTIPLIER
         return max(self.cfg.vad_threshold, adaptive)
 
+    def _reset_interrupt_capture(self) -> None:
+        self.interrupt_requested.clear()
+        self.interrupt_voice_frames = 0
+        self.interrupt_preroll.clear()
+        self.interrupt_buffer_chunks = []
+
+    def _capture_interrupt_chunk(self, chunk: np.ndarray, voiced: bool) -> None:
+        if not voiced:
+            self.interrupt_preroll.append(chunk.copy())
+            if self.interrupt_buffer_chunks:
+                self.interrupt_buffer_chunks.append(chunk.copy())
+            return
+
+        if not self.interrupt_buffer_chunks:
+            self.interrupt_buffer_chunks = [buf.copy() for buf in self.interrupt_preroll]
+        self.interrupt_buffer_chunks.append(chunk.copy())
+        self.interrupt_preroll.append(chunk.copy())
+
+    def _promote_interrupt_buffer_to_pending(self) -> None:
+        if not self.interrupt_buffer_chunks:
+            return
+        with self._pending_priority_lock:
+            self.pending_priority_chunks.extend(self.interrupt_buffer_chunks)
+        self.interrupt_buffer_chunks = []
+
+    def _take_pending_priority_chunks(self) -> List[np.ndarray]:
+        with self._pending_priority_lock:
+            if not self.pending_priority_chunks:
+                return []
+            chunks = self.pending_priority_chunks
+            self.pending_priority_chunks = []
+            return chunks
+
+    def _advance_turn_id(self) -> int:
+        with self.turn_lock:
+            self.current_turn_id += 1
+            return self.current_turn_id
+
+    def _get_current_turn_id(self) -> int:
+        with self.turn_lock:
+            return self.current_turn_id
+
+    def _is_turn_current(self, turn_id: int) -> bool:
+        return not self.stop_event.is_set() and turn_id == self._get_current_turn_id()
+
+    def _interrupt_active_turn(self, reason: str) -> None:
+        if self.interrupt_requested.is_set():
+            return
+        self.last_response_interrupted = True
+        self._advance_turn_id()
+        self.interrupt_requested.set()
+        self.preempt_requested.set()
+        self._emit_ui("log", reason)
+
+    def _mic_interrupt_callback(self, indata, frames, _time_info, status) -> None:
+        """Callback for the secondary microphone stream used for interrupt detection.
+
+        This only processes audio when the bot is speaking. It uses a simple
+        RMS-only VAD to detect if the interviewer is talking over the bot.
+        """
+        if status:
+            logger.debug("Mic interrupt stream status: %s", status)
+        if self.stop_event.is_set():
+            return
+
+        # Only check during TTS playback
+        if not self.is_speaking.is_set():
+            self._mic_interrupt_voice_frames = 0
+            return
+
+        # Already interrupted — nothing more to do
+        if self.interrupt_requested.is_set():
+            return
+
+        chunk = indata[:, 0].copy().astype(np.float32)
+        voiced = is_voice_frame_simple(chunk)
+
+        if voiced:
+            self._mic_interrupt_voice_frames += 1
+            if self._mic_interrupt_voice_frames >= INTERRUPT_CONSECUTIVE_FRAMES:
+                self._interrupt_active_turn(
+                    "[MIC] Interviewer speech detected during playback. Stopping current answer."
+                )
+        else:
+            self._mic_interrupt_voice_frames = max(0, self._mic_interrupt_voice_frames - 1)
+
+    def _start_mic_interrupt_stream(self) -> None:
+        """Open a secondary microphone stream for interrupt detection.
+
+        This is used when input_mode is system_audio and there's a risk of
+        capturing our own TTS output. The mic stream runs independently and
+        only triggers interrupt detection during TTS playback.
+        """
+        if self._mic_interrupt_stream is not None:
+            return
+        try:
+            self._mic_interrupt_stream = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=CHANNELS,
+                blocksize=self.frame_samples,
+                dtype="float32",
+                device=None,  # default microphone
+                callback=self._mic_interrupt_callback,
+            )
+            self._mic_interrupt_stream.start()
+            self._mic_interrupt_available = True
+            self._emit_ui(
+                "log",
+                "Secondary microphone opened for interrupt/barge-in detection.",
+            )
+        except Exception as exc:
+            self._mic_interrupt_available = False
+            self._emit_ui(
+                "log",
+                f"Could not open microphone for interrupt detection: {exc}. "
+                "Barge-in may not work during playback.",
+            )
+            logger.debug("Mic interrupt stream open failed", exc_info=True)
+
+    def _stop_mic_interrupt_stream(self) -> None:
+        """Close the secondary microphone stream."""
+        if self._mic_interrupt_stream is not None:
+            try:
+                self._mic_interrupt_stream.stop()
+                self._mic_interrupt_stream.close()
+            except Exception:
+                logger.debug("Mic interrupt stream close warning", exc_info=True)
+            finally:
+                self._mic_interrupt_stream = None
+                self._mic_interrupt_available = False
+
     def _ingest_input_chunk(self, chunk: np.ndarray) -> None:
         if self.stop_event.is_set():
             return
@@ -678,27 +872,44 @@ class InterviewAgent:
             self._update_noise_floor(rms)
 
         if self.turn_in_progress.is_set() and not self.is_speaking.is_set() and can_detect_interruptions:
-            if is_voice_frame(chunk, rms, effective_threshold):
+            if voiced:
                 self.preempt_voice_frames += 1
                 if self.preempt_voice_frames >= PREEMPT_CONSECUTIVE_FRAMES:
-                    self.preempt_requested.set()
+                    self._interrupt_active_turn(
+                        "New interviewer speech detected while a response was being prepared. Cancelling stale turn."
+                    )
             else:
                 self.preempt_voice_frames = max(0, self.preempt_voice_frames - 1)
         elif not self.turn_in_progress.is_set():
             self.preempt_voice_frames = 0
+            self.preempt_requested.clear()
 
         # In system-audio mode, when output goes to default speakers, loopback captures our
         # own TTS. Drop input while speaking to prevent self-transcription loops.
+        # NOTE: Interrupt detection is handled by the secondary mic stream (_mic_interrupt_callback),
+        # not by this path. We still drop the loopback audio to prevent self-transcription.
         if self.is_speaking.is_set() and self.capture_own_output_risk:
-            return
+            # If an interrupt was already triggered (by the mic stream), let audio through
+            # so the post-interrupt speech enters the main queue for transcription.
+            if self.interrupt_requested.is_set():
+                # Interrupt was detected — stop dropping, let audio flow to queue
+                pass
+            else:
+                return
 
-        if self.is_speaking.is_set() and can_detect_interruptions:
-            if is_voice_frame(chunk, rms, effective_threshold):
+        if self.is_speaking.is_set() and can_detect_interruptions and not self.capture_own_output_risk:
+            # Non-risk path: system audio doesn't capture own TTS (e.g. VB-Cable),
+            # or input_mode is microphone. Use the main stream for interrupt detection.
+            self._capture_interrupt_chunk(chunk, voiced)
+            if voiced:
                 self.interrupt_voice_frames += 1
                 if self.interrupt_voice_frames >= INTERRUPT_CONSECUTIVE_FRAMES:
-                    self.interrupt_requested.set()
+                    self._interrupt_active_turn(
+                        "Interviewer speech detected during playback. Stopping current answer."
+                    )
             else:
                 self.interrupt_voice_frames = max(0, self.interrupt_voice_frames - 1)
+            return
         try:
             self.audio_queue.put_nowait(chunk)
         except queue.Full:
@@ -892,8 +1103,10 @@ class InterviewAgent:
         if self.capture_own_output_risk:
             self._emit_ui(
                 "log",
-                "Speaker loopback risk detected; input is muted while TTS plays to prevent self-interruption.",
+                "Speaker loopback risk detected; system audio muted during TTS to prevent self-loop. "
+                "Opening secondary microphone for barge-in/interrupt detection...",
             )
+            self._start_mic_interrupt_stream()
         self.worker_thread = threading.Thread(target=self._audio_worker, daemon=True)
         self.worker_thread.start()
 
@@ -929,6 +1142,7 @@ class InterviewAgent:
             return
         self.stop_event.set()
         self._emit_ui("status", "Stopping...")
+        self._stop_mic_interrupt_stream()
         try:
             if self.stream is not None:
                 self.stream.stop()
@@ -944,6 +1158,58 @@ class InterviewAgent:
 
         if self.worker_thread and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=2.0)
+        if self.response_thread and self.response_thread.is_alive():
+            self.response_thread.join(timeout=2.0)
+
+    def _process_audio_chunk(
+        self,
+        chunk: np.ndarray,
+        speaking: bool,
+        silence_sec: float,
+        speech_chunks: List[np.ndarray],
+        speech_sec: float,
+    ) -> Tuple[bool, float, List[np.ndarray], float]:
+        rms = float(np.sqrt(np.mean(np.square(chunk))) + 1e-12)
+        effective_threshold = self._get_effective_threshold()
+        voiced = is_voice_frame(chunk, rms, effective_threshold)
+
+        if voiced:
+            if not speaking:
+                speaking = True
+                speech_chunks = []
+                speech_sec = 0.0
+                silence_sec = 0.0
+                self._emit_ui("status", "Listening... (speech detected)")
+            speech_chunks.append(chunk)
+            speech_sec += FRAME_DURATION_SEC
+            silence_sec = 0.0
+            if speech_sec >= MAX_QUESTION_SECONDS:
+                self._dispatch_detected_question(speech_chunks)
+                speaking = False
+                speech_chunks = []
+                speech_sec = 0.0
+                silence_sec = 0.0
+            return speaking, silence_sec, speech_chunks, speech_sec
+
+        if speaking:
+            speech_chunks.append(chunk)
+            speech_sec += FRAME_DURATION_SEC
+            silence_sec += FRAME_DURATION_SEC
+            if silence_sec >= self.cfg.silence_timeout_sec:
+                min_speech_sec = (
+                    INTERRUPT_MIN_QUESTION_SECONDS
+                    if self.last_response_interrupted
+                    else MIN_QUESTION_SECONDS
+                )
+                if speech_sec >= min_speech_sec:
+                    self._dispatch_detected_question(speech_chunks)
+                speaking = False
+                speech_chunks = []
+                speech_sec = 0.0
+                silence_sec = 0.0
+                self._emit_ui("status", "Listening...")
+
+        return speaking, silence_sec, speech_chunks, speech_sec
 
     def _audio_worker(self) -> None:
         speaking = False
@@ -952,138 +1218,127 @@ class InterviewAgent:
         speech_sec = 0.0
 
         while not self.stop_event.is_set():
+            pending_chunks = self._take_pending_priority_chunks()
+            if pending_chunks:
+                if not speaking:
+                    self._emit_ui("status", "Listening... (interruption captured)")
+                for chunk in pending_chunks:
+                    (
+                        speaking,
+                        silence_sec,
+                        speech_chunks,
+                        speech_sec,
+                    ) = self._process_audio_chunk(
+                        chunk, speaking, silence_sec, speech_chunks, speech_sec
+                    )
+                continue
+
             try:
                 chunk = self.audio_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            rms = float(np.sqrt(np.mean(np.square(chunk))) + 1e-12)
-            effective_threshold = self._get_effective_threshold()
-            voiced = is_voice_frame(chunk, rms, effective_threshold)
+            speaking, silence_sec, speech_chunks, speech_sec = self._process_audio_chunk(
+                chunk, speaking, silence_sec, speech_chunks, speech_sec
+            )
 
-            if voiced:
-                if not speaking:
-                    speaking = True
-                    speech_chunks = []
-                    speech_sec = 0.0
-                    silence_sec = 0.0
-                    self._emit_ui("status", "Listening... (speech detected)")
-                speech_chunks.append(chunk)
-                speech_sec += FRAME_DURATION_SEC
-                silence_sec = 0.0
-                if speech_sec >= MAX_QUESTION_SECONDS:
-                    self._handle_detected_question(speech_chunks)
-                    speaking = False
-                    speech_chunks = []
-                    speech_sec = 0.0
-                    silence_sec = 0.0
-                continue
+    def _dispatch_detected_question(self, chunks: List[np.ndarray]) -> None:
+        if self.stop_event.is_set():
+            return
 
-            if speaking:
-                speech_chunks.append(chunk)
-                speech_sec += FRAME_DURATION_SEC
-                silence_sec += FRAME_DURATION_SEC
-                if silence_sec >= self.cfg.silence_timeout_sec:
-                    if speech_sec >= MIN_QUESTION_SECONDS:
-                        self._handle_detected_question(speech_chunks)
-                    speaking = False
-                    speech_chunks = []
-                    speech_sec = 0.0
-                    silence_sec = 0.0
-                    self._emit_ui("status", "Listening...")
+        interrupted_turn = self.last_response_interrupted
+        self.last_response_interrupted = False
+        waveform = np.concatenate(chunks).astype(np.float32)
+        min_question_sec = (
+            INTERRUPT_MIN_QUESTION_SECONDS if interrupted_turn else MIN_QUESTION_SECONDS
+        )
+        if waveform.size < int(SAMPLE_RATE * min_question_sec):
+            return
 
-    def _handle_detected_question(self, chunks: List[np.ndarray]) -> None:
+        turn_id = self._advance_turn_id()
         with self.processing_lock:
-            preserve_audio_queue = False
+            self.active_response_workers += 1
+            self.turn_in_progress.set()
+        self.preempt_requested.clear()
+        self.preempt_voice_frames = 0
+        response_thread = threading.Thread(
+            target=self._handle_detected_question,
+            args=(turn_id, waveform),
+            daemon=True,
+        )
+        self.response_thread = response_thread
+        response_thread.start()
+
+    def _handle_detected_question(self, turn_id: int, waveform: np.ndarray) -> None:
+        try:
+            if not self._is_turn_current(turn_id):
+                return
+
+            self._emit_ui("status", "Transcribing question...")
             try:
-                if self.stop_event.is_set():
-                    return
-                self.last_response_interrupted = False
-                self.turn_in_progress.set()
-                self.preempt_requested.clear()
-                self.preempt_voice_frames = 0
-                waveform = np.concatenate(chunks).astype(np.float32)
-                if waveform.size < int(SAMPLE_RATE * MIN_QUESTION_SECONDS):
-                    return
-
-                self._emit_ui("status", "Transcribing question...")
-                try:
-                    question = self._transcribe_audio(waveform)
-                except Exception as exc:
+                question = self._transcribe_audio(waveform)
+            except Exception as exc:
+                if self._is_turn_current(turn_id):
                     self._emit_api_error("Transcription failed", exc)
-                    return
-                if self.stop_event.is_set():
-                    return
+                return
+            if not self._is_turn_current(turn_id):
+                return
 
-                if not question:
-                    self._emit_ui("log", "No clear question detected. Continuing to listen.")
-                    return
-                if self.preempt_requested.is_set():
-                    preserve_audio_queue = True
-                    self._emit_ui(
-                        "log",
-                        "New interviewer speech detected. Dropping pending answer and prioritizing latest input.",
-                    )
-                    self._emit_ui("status", "Listening...")
-                    return
+            if not question:
+                self._emit_ui("log", "No clear question detected. Continuing to listen.")
+                return
 
-                self._emit_ui("log", f"Question heard: {question}")
-                self._emit_ui("status", "Generating answer...")
+            self._emit_ui("log", f"Question heard: {question}")
+            self._emit_ui("status", "Generating answer...")
 
-                try:
-                    answer = self._generate_answer(question)
-                except Exception as exc:
+            try:
+                answer = self._generate_answer(question, turn_id)
+            except Exception as exc:
+                if self._is_turn_current(turn_id):
                     self._emit_api_error("Answer generation failed", exc)
-                    return
-                if self.stop_event.is_set():
-                    return
-                if self.preempt_requested.is_set():
-                    preserve_audio_queue = True
-                    self._emit_ui(
-                        "log",
-                        "New interviewer speech detected. Dropping pending answer and prioritizing latest input.",
-                    )
-                    self._emit_ui("status", "Listening...")
-                    return
+                return
+            if not self._is_turn_current(turn_id):
+                return
 
-                if not answer:
-                    self._emit_ui("log", "LLM returned empty answer. Skipping response.")
-                    return
+            if not answer:
+                self._emit_ui("log", "LLM returned empty answer. Skipping response.")
+                return
 
-                self._emit_ui("log", f"Answering: {answer}")
-                self._emit_ui("status", "Speaking answer...")
+            self._emit_ui("log", f"Answering: {answer}")
+            self._emit_ui("status", "Speaking answer...")
 
-                try:
-                    tts_bytes = self._text_to_speech(answer)
-                    if self.preempt_requested.is_set():
-                        preserve_audio_queue = True
-                        self._emit_ui(
-                            "log",
-                            "New interviewer speech detected during TTS prep. Prioritizing latest input.",
-                        )
-                        self._emit_ui("status", "Listening...")
-                        return
-                    interrupted = self._play_audio_bytes(tts_bytes)
-                    if interrupted:
-                        preserve_audio_queue = True
-                        self._play_interrupt_filler()
-                        self._emit_ui(
-                            "log",
-                            "Interviewer interruption detected. Played filler and listening now...",
-                        )
-                        self.last_response_interrupted = True
-                    else:
-                        self._record_turn(question, answer)
-                except Exception as exc:
+            try:
+                tts_bytes = self._text_to_speech(answer)
+            except Exception as exc:
+                if self._is_turn_current(turn_id):
+                    self._emit_api_error("Speech synthesis failed", exc)
+                return
+            if not self._is_turn_current(turn_id):
+                return
+
+            try:
+                interrupted = self._play_audio_bytes(tts_bytes, turn_id)
+            except Exception as exc:
+                if self._is_turn_current(turn_id):
                     self._emit_api_error("Speech playback failed", exc)
-                    return
+                return
 
-                self._emit_ui("status", "Listening...")
-            finally:
+            if interrupted or not self._is_turn_current(turn_id):
+                if interrupted:
+                    self._record_turn(question, answer + " [INTERRUPTED]")
+                return
+
+            self._record_turn(question, answer)
+            self._emit_ui("status", "Listening...")
+        finally:
+            with self.processing_lock:
+                self.active_response_workers = max(0, self.active_response_workers - 1)
+                no_active_workers = self.active_response_workers == 0
+            if no_active_workers:
                 self.turn_in_progress.clear()
                 self.preempt_requested.clear()
                 self.preempt_voice_frames = 0
-                if not self.last_response_interrupted and not preserve_audio_queue:
+                if self._is_turn_current(turn_id):
                     self._clear_audio_queue()
 
     def _transcribe_audio(self, waveform: np.ndarray) -> str:
@@ -1123,68 +1378,116 @@ class InterviewAgent:
             cleaned = f"{cleaned}."
         return cleaned
 
-    def _generate_answer(self, question: str) -> str:
+    def _generate_answer(self, question: str, turn_id: int) -> str:
         messages: List[Dict[str, Any]] = [{"role": "system", "content": self.system_prompt}]
-        if self.memory_summary:
+        with self.history_lock:
+            memory_summary = compact_model_text(
+                self.memory_summary, max_chars=MEMORY_SUMMARY_MAX_CHARS
+            )
+            recent_history = list(self.history[-MAX_PROMPT_RECENT_MESSAGES:])
+        if memory_summary:
             messages.append(
                 {
                     "role": "system",
-                    "content": (
-                        "Conversation memory (high-priority consistency context):\n"
-                        f"{self.memory_summary}"
-                    ),
+                    "content": f"Conversation memory:\n{memory_summary}",
                 }
             )
-        messages.extend(self.history[-MAX_HISTORY_MESSAGES:])
-        messages.append({"role": "user", "content": question})
+        messages.extend(recent_history)
+        messages.append({"role": "user", "content": compact_model_text(question, max_chars=500)})
 
-        completion = self.client.chat.completions.create(
+        stream = self.client.chat.completions.create(
             model="llama-3.1-8b-instant",
             messages=messages,
             temperature=0.55,
             max_tokens=ANSWER_MAX_TOKENS,
+            stream=True,
         )
 
-        answer = completion.choices[0].message.content or ""
+        answer_parts: List[str] = []
+        for chunk in stream:
+            if not self._is_turn_current(turn_id):
+                return ""
+            try:
+                delta = chunk.choices[0].delta
+            except Exception:
+                continue
+            content = getattr(delta, "content", None)
+            if not content:
+                continue
+            if isinstance(content, str):
+                answer_parts.append(content)
+                continue
+            if isinstance(content, list):
+                for item in content:
+                    if isinstance(item, str):
+                        answer_parts.append(item)
+                    elif isinstance(item, dict):
+                        text = item.get("text")
+                        if text:
+                            answer_parts.append(text)
+                    else:
+                        text = getattr(item, "text", None)
+                        if text:
+                            answer_parts.append(text)
+
+        answer = "".join(answer_parts)
         answer = self._compact_tts_text(answer, ANSWER_MAX_WORDS, ANSWER_MAX_CHARS)
         return answer
 
     def _record_turn(self, question: str, answer: str) -> None:
-        self.history.append({"role": "user", "content": question})
-        self.history.append({"role": "assistant", "content": answer})
-        self.turn_count += 1
-        if len(self.history) > MAX_HISTORY_MESSAGES:
-            self.history = self.history[-MAX_HISTORY_MESSAGES:]
-        if self.turn_count % 2 == 0:
-            self._refresh_memory_summary()
+        latest_exchange: List[Dict[str, str]] = []
+        with self.history_lock:
+            compact_question = compact_model_text(question)
+            compact_answer = compact_model_text(answer)
+            self.history.append({"role": "user", "content": compact_question})
+            self.history.append({"role": "assistant", "content": compact_answer})
+            self.turn_count += 1
+            if len(self.history) > MAX_HISTORY_MESSAGES:
+                self.history = self.history[-MAX_HISTORY_MESSAGES:]
+            latest_exchange = self.history[-2:]
+        self._refresh_memory_summary(latest_exchange)
 
-    def _refresh_memory_summary(self) -> None:
-        if len(self.history) < 2:
+    def _refresh_memory_summary(self, latest_exchange: Optional[List[Dict[str, str]]] = None) -> None:
+        if not latest_exchange:
             return
         try:
+            with self.history_lock:
+                existing_summary = compact_model_text(
+                    self.memory_summary, max_chars=MEMORY_SUMMARY_MAX_CHARS
+                )
+            latest_text = format_history_for_memory(latest_exchange)
+            if not latest_text:
+                return
+            user_content = latest_text
+            if existing_summary:
+                user_content = f"Existing memory:\n{existing_summary}\n\nLatest exchange:\n{latest_text}"
             completion = self.client.chat.completions.create(
                 model="llama-3.1-8b-instant",
                 temperature=0.2,
-                max_tokens=170,
+                max_tokens=120,
                 messages=[
                     {
                         "role": "system",
                         "content": (
-                            "Summarize interview context in compact bullet points for memory. "
-                            "Include: claims about experience, projects, strengths, weaknesses, "
-                            "leadership examples, and any facts that should stay consistent. "
-                            "Do not include fluff."
+                            "Update the interview memory into compact bullet points. "
+                            "Keep only facts that matter for future consistency: experience, projects, "
+                            "skills, strengths, weaknesses, preferences, leadership examples, and open threads. "
+                            "Avoid fluff and repetition."
                         ),
                     },
                     {
                         "role": "user",
-                        "content": json.dumps(self.history[-8:], ensure_ascii=True),
+                        "content": user_content,
                     },
                 ],
             )
-            summary = (completion.choices[0].message.content or "").strip()
+            summary = compact_model_text(
+                (completion.choices[0].message.content or "").strip(),
+                max_chars=MEMORY_SUMMARY_MAX_CHARS,
+            )
             if summary:
-                self.memory_summary = summary
+                with self.history_lock:
+                    self.memory_summary = summary
         except Exception as exc:
             logger.debug("Memory summary refresh failed: %s", exc)
 
@@ -1247,14 +1550,13 @@ class InterviewAgent:
 
         return audio_bytes
 
-    def _play_audio_bytes(self, audio_bytes: bytes) -> bool:
+    def _play_audio_bytes(self, audio_bytes: bytes, turn_id: int) -> bool:
         data, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="float32")
         playback_data = data if data.ndim == 1 else data[:, 0]
         if playback_data.size == 0:
             return False
 
-        self.interrupt_requested.clear()
-        self.interrupt_voice_frames = 0
+        self._reset_interrupt_capture()
         self.is_speaking.set()
 
         interrupted = False
@@ -1270,7 +1572,7 @@ class InterviewAgent:
             cursor = 0
             total = playback_data.shape[0]
             while cursor < total and not self.stop_event.is_set():
-                if self.interrupt_requested.is_set():
+                if self.interrupt_requested.is_set() or not self._is_turn_current(turn_id):
                     interrupted = True
                     break
                 end = min(cursor + OUTPUT_CHUNK_SAMPLES, total)
@@ -1286,8 +1588,9 @@ class InterviewAgent:
             except Exception:
                 logger.debug("Output stream close warning", exc_info=True)
             self.is_speaking.clear()
-            self.interrupt_requested.clear()
-            self.interrupt_voice_frames = 0
+            if interrupted:
+                self._promote_interrupt_buffer_to_pending()
+            self._reset_interrupt_capture()
 
         return interrupted
 
@@ -1309,6 +1612,8 @@ class InterviewAgent:
                 self.audio_queue.get_nowait()
             except queue.Empty:
                 break
+        with self._pending_priority_lock:
+            self.pending_priority_chunks = []
 
 
 def run_app() -> None:
