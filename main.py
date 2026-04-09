@@ -40,6 +40,7 @@ MIN_QUESTION_SECONDS = 0.8
 MAX_QUESTION_SECONDS = 25.0
 MAX_HISTORY_MESSAGES = 8
 MAX_PROMPT_RECENT_MESSAGES = 4
+BARGE_IN_ENABLED = False
 INTERRUPT_CONSECUTIVE_FRAMES = 2
 PREEMPT_CONSECUTIVE_FRAMES = 3
 OUTPUT_CHUNK_SAMPLES = 1024
@@ -346,7 +347,6 @@ def build_system_prompt(cfg: AppConfig) -> str:
         "- Be concise: usually 1 to 4 sentences.\n"
         "- Be natural and direct, not formal or robotic.\n"
         "- Continue the existing conversation consistently.\n"
-        "- If the prior answer ended with [INTERRUPTED], recover naturally.\n"
         "- After the opening hello, skip pleasantries and answer immediately.\n"
         "- Never say you are an AI."
     )
@@ -657,8 +657,9 @@ class InterviewAgent:
         self._mic_interrupt_voice_frames = 0
 
     def _can_detect_interruptions(self) -> bool:
-        """Always return True — we use the secondary mic for interrupt
-        detection when system audio has capture_own_output_risk."""
+        """Return whether live playback interruption detection is enabled."""
+        if not BARGE_IN_ENABLED:
+            return False
         if self.cfg.input_mode == "microphone":
             return True
         # When we have a mic interrupt stream, we can always detect.
@@ -771,6 +772,8 @@ class InterviewAgent:
         return not self.stop_event.is_set() and turn_id == self._get_current_turn_id()
 
     def _interrupt_active_turn(self, reason: str) -> None:
+        if not BARGE_IN_ENABLED:
+            return
         if self.interrupt_requested.is_set():
             return
         self.last_response_interrupted = True
@@ -870,6 +873,11 @@ class InterviewAgent:
         voiced = is_voice_frame(chunk, rms, effective_threshold)
         if not voiced:
             self._update_noise_floor(rms)
+
+        # Barge-in is disabled. Ignore incoming audio while we are generating or
+        # speaking so the current turn always completes before a new one starts.
+        if not BARGE_IN_ENABLED and self.turn_in_progress.is_set():
+            return
 
         if self.turn_in_progress.is_set() and not self.is_speaking.is_set() and can_detect_interruptions:
             if voiced:
@@ -1103,18 +1111,18 @@ class InterviewAgent:
         if self.capture_own_output_risk:
             self._emit_ui(
                 "log",
-                "Speaker loopback risk detected; system audio muted during TTS to prevent self-loop. "
-                "Opening secondary microphone for barge-in/interrupt detection...",
+                "Speaker loopback risk detected; system audio will be muted during TTS to prevent self-loop.",
             )
-            self._start_mic_interrupt_stream()
         self.worker_thread = threading.Thread(target=self._audio_worker, daemon=True)
         self.worker_thread.start()
 
-        # Pre-generate filler clips in background (non-blocking)
-        filler_thread = threading.Thread(
-            target=self._generate_filler_clips_background, daemon=True
-        )
-        filler_thread.start()
+        if BARGE_IN_ENABLED and self.capture_own_output_risk:
+            self._start_mic_interrupt_stream()
+        if BARGE_IN_ENABLED:
+            filler_thread = threading.Thread(
+                target=self._generate_filler_clips_background, daemon=True
+            )
+            filler_thread.start()
 
         if self.cfg.input_mode == "system_audio":
             self.capture_thread = threading.Thread(
@@ -1196,12 +1204,7 @@ class InterviewAgent:
             speech_sec += FRAME_DURATION_SEC
             silence_sec += FRAME_DURATION_SEC
             if silence_sec >= self.cfg.silence_timeout_sec:
-                min_speech_sec = (
-                    INTERRUPT_MIN_QUESTION_SECONDS
-                    if self.last_response_interrupted
-                    else MIN_QUESTION_SECONDS
-                )
-                if speech_sec >= min_speech_sec:
+                if speech_sec >= MIN_QUESTION_SECONDS:
                     self._dispatch_detected_question(speech_chunks)
                 speaking = False
                 speech_chunks = []
@@ -1246,13 +1249,8 @@ class InterviewAgent:
         if self.stop_event.is_set():
             return
 
-        interrupted_turn = self.last_response_interrupted
-        self.last_response_interrupted = False
         waveform = np.concatenate(chunks).astype(np.float32)
-        min_question_sec = (
-            INTERRUPT_MIN_QUESTION_SECONDS if interrupted_turn else MIN_QUESTION_SECONDS
-        )
-        if waveform.size < int(SAMPLE_RATE * min_question_sec):
+        if waveform.size < int(SAMPLE_RATE * MIN_QUESTION_SECONDS):
             return
 
         turn_id = self._advance_turn_id()
@@ -1324,8 +1322,6 @@ class InterviewAgent:
                 return
 
             if interrupted or not self._is_turn_current(turn_id):
-                if interrupted:
-                    self._record_turn(question, answer + " [INTERRUPTED]")
                 return
 
             self._record_turn(question, answer)

@@ -14,10 +14,9 @@ This desktop app listens to interview questions, transcribes them with Groq Whis
   - `speakers` (fallback/testing mode).
 
 ## Interview behavior guarantees
-- Interruption-first handling: if interviewer speech is detected while the app is answering, playback is stopped immediately.
-- Latest input wins: new interviewer speech during answer preparation drops the pending answer and prioritizes the newer input.
-- No forced resume: interrupted answers are not auto-resumed unless explicitly asked.
-- Consistency: response memory is preserved only for completed turns to reduce contradiction drift from interrupted outputs.
+- No barge-in: once the app starts generating or speaking an answer, it finishes that turn before listening for the next question.
+- Loopback-safe playback: in system-audio mode, input is muted during TTS when needed to avoid self-transcription loops.
+- Consistency: response memory is preserved only for completed turns.
 - Clarification-first on unclear prompts: model instructions explicitly ask for clarification when a question is cut off or unclear.
 
 ## 1) Install prerequisites (one-time)
