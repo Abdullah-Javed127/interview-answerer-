@@ -234,6 +234,92 @@ def enumerate_audio_devices() -> Dict[str, List[Tuple[int, str]]]:
     return {"input": inputs, "output": outputs}
 
 
+def looks_like_virtual_cable_device(name: str) -> bool:
+    normalized = name.strip().lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in ("cable input", "cable output", "vb-audio", "virtual cable"))
+
+
+def get_hostapi_name(dev: Dict[str, Any], hostapis: Optional[List[Dict[str, Any]]] = None) -> str:
+    hostapi_index = dev.get("hostapi")
+    if hostapi_index is None:
+        return ""
+    try:
+        hostapis = hostapis if hostapis is not None else sd.query_hostapis()
+        if 0 <= int(hostapi_index) < len(hostapis):
+            return str(hostapis[int(hostapi_index)].get("name", "")).strip()
+    except Exception:
+        pass
+    return ""
+
+
+def describe_audio_output_device(
+    idx: Optional[int], dev: Optional[Dict[str, Any]], hostapis: Optional[List[Dict[str, Any]]] = None
+) -> str:
+    if idx is None or dev is None:
+        return "default speakers"
+    name = str(dev.get("name", f"Device {idx}"))
+    hostapi_name = get_hostapi_name(dev, hostapis)
+    if hostapi_name:
+        return f'"{name}" via {hostapi_name} (index {idx})'
+    return f'"{name}" (index {idx})'
+
+
+def describe_audio_device(idx: int, dev: Dict[str, Any], hostapis: Optional[List[Dict[str, Any]]] = None) -> str:
+    name = str(dev.get("name", f"Device {idx}"))
+    hostapi_name = get_hostapi_name(dev, hostapis)
+    input_channels = int(dev.get("max_input_channels", 0) or 0)
+    output_channels = int(dev.get("max_output_channels", 0) or 0)
+    directions: List[str] = []
+    if input_channels >= 1:
+        directions.append(f"in:{input_channels}")
+    if output_channels >= 1:
+        directions.append(f"out:{output_channels}")
+    directions_text = ", ".join(directions) if directions else "no-io"
+    if hostapi_name:
+        return f'"{name}" via {hostapi_name} (index {idx}, {directions_text})'
+    return f'"{name}" (index {idx}, {directions_text})'
+
+
+def choose_best_virtual_cable_output() -> Tuple[Optional[int], str, str]:
+    devices = sd.query_devices()
+    try:
+        hostapis = sd.query_hostapis()
+    except Exception:
+        hostapis = []
+
+    candidates: List[Tuple[int, int, str, str]] = []
+    for idx, dev in enumerate(devices):
+        if dev.get("max_output_channels", 0) < 1:
+            continue
+        raw_name = str(dev.get("name", ""))
+        lowered_name = raw_name.lower()
+        if not looks_like_virtual_cable_device(raw_name):
+            continue
+
+        hostapi_name = get_hostapi_name(dev, hostapis).lower()
+        score = 0
+        if "cable input" in lowered_name:
+            score += 100
+        if "virtual cable" in lowered_name:
+            score += 30
+        if "vb-audio" in lowered_name:
+            score += 20
+        if "wasapi" in hostapi_name:
+            score += 10
+        if "mme" in hostapi_name:
+            score -= 5
+
+        candidates.append((score, idx, raw_name, describe_audio_output_device(idx, dev, hostapis)))
+
+    if not candidates:
+        return None, "", "default speakers"
+
+    _, idx, raw_name, label = max(candidates, key=lambda item: (item[0], -item[1]))
+    return idx, raw_name, label
+
+
 def default_config_raw() -> Dict[str, Any]:
     return {
         "groq_api_key": "",
@@ -618,13 +704,13 @@ class InterviewAgent:
         self.turn_lock = threading.Lock()
         self.active_response_workers = 0
         self.frame_samples = int(SAMPLE_RATE * FRAME_DURATION_SEC)
+        self.output_device_name_resolved = ""
+        self.output_device_label = "default speakers"
         self.output_device = self._select_output_device()
         self.input_device, self.loopback_speaker_name, self.input_source_label = (
             self._select_input_source()
         )
-        self.capture_own_output_risk = (
-            self.cfg.input_mode == "system_audio" and self.output_device is None
-        )
+        self.capture_own_output_risk = self._detect_output_loopback_overlap()
         self.is_speaking = threading.Event()
         self.turn_in_progress = threading.Event()
         self.interrupt_requested = threading.Event()
@@ -980,38 +1066,141 @@ class InterviewAgent:
                     logger.debug("COM uninitialize warning", exc_info=True)
 
     def _select_output_device(self) -> Optional[int]:
+        devices = sd.query_devices()
+        try:
+            hostapis = sd.query_hostapis()
+        except Exception:
+            hostapis = []
+
         # If user explicitly selected an output device by name, use it
         if self.cfg.output_device_name:
-            devices = sd.query_devices()
             for idx, dev in enumerate(devices):
-                if dev.get("max_output_channels", 0) >= 1 and dev.get("name") == self.cfg.output_device_name:
-                    self._emit_ui("log", f'Output device selected: "{dev["name"]}".')
+                dev_name = str(dev.get("name", "")).strip()
+                if dev.get("max_output_channels", 0) >= 1 and dev_name.lower() == self.cfg.output_device_name.lower():
+                    self.output_device_name_resolved = dev_name
+                    self.output_device_label = describe_audio_output_device(idx, dev, hostapis)
+                    self._emit_ui("log", f"Output device selected: {self.output_device_label}.")
                     return idx
             self._emit_ui("log", f'Configured output device "{self.cfg.output_device_name}" not found. Falling back to auto-detect.')
 
         if self.cfg.output_mode == "speakers":
+            self.output_device_name_resolved = ""
+            self.output_device_label = "default speakers"
             self._emit_ui("log", "Output mode: speakers (default output device).")
             return None
 
-        devices = sd.query_devices()
-        candidates = []
-        for idx, dev in enumerate(devices):
-            if dev.get("max_output_channels", 0) < 1:
-                continue
-            name = str(dev.get("name", "")).lower()
-            if "cable input" in name or "vb-audio" in name or "virtual cable" in name:
-                candidates.append((idx, dev.get("name", "")))
-
-        if candidates:
-            idx, name = candidates[0]
-            self._emit_ui("log", f'Output mode: virtual_cable (using "{name}").')
+        idx, raw_name, label = choose_best_virtual_cable_output()
+        if idx is not None:
+            self.output_device_name_resolved = raw_name
+            self.output_device_label = label
+            self._emit_ui("log", f"Output mode: virtual_cable (using {label}).")
             return idx
 
+        self.output_device_name_resolved = ""
+        self.output_device_label = "default speakers"
         self._emit_ui(
             "log",
             "Virtual cable requested but no VB-Cable output device found. Falling back to speakers.",
         )
         return None
+
+    def _detect_output_loopback_overlap(self) -> bool:
+        if self.cfg.input_mode != "system_audio":
+            return False
+        if self.output_device is None:
+            return True
+        if not self.output_device_name_resolved or not self.loopback_speaker_name:
+            return False
+
+        output_name = self.output_device_name_resolved.strip().lower()
+        loopback_name = str(self.loopback_speaker_name).strip().lower()
+        if not output_name or not loopback_name:
+            return False
+
+        if output_name in loopback_name or loopback_name in output_name:
+            return True
+        if looks_like_virtual_cable_device(output_name) and looks_like_virtual_cable_device(loopback_name):
+            return True
+        return False
+
+    def _emit_routing_guidance(self) -> None:
+        if self.cfg.output_mode != "virtual_cable":
+            return
+
+        if self.output_device is None:
+            self._emit_ui(
+                "log",
+                "WARNING: virtual_cable mode is not active. The app fell back to speakers, so Meet/Zoom will not receive bot audio until you choose a VB-Cable output device.",
+            )
+            return
+
+        self._emit_ui(
+            "log",
+            "Meet/Zoom must use 'CABLE Output (VB-Audio Virtual Cable)' as the microphone. This app only chooses where the bot speaks; it cannot switch the browser mic automatically.",
+        )
+
+        if self.cfg.input_mode == "system_audio" and looks_like_virtual_cable_device(self.loopback_speaker_name or ""):
+            self._emit_ui(
+                "log",
+                "WARNING: system-audio capture is currently loopbacking a virtual cable endpoint. Keep Meet/Zoom speaker output on your real headphones or speakers, not on VB-Cable, or the app will listen to the wrong path.",
+            )
+
+    def _emit_audio_device_diagnostics(self) -> None:
+        try:
+            devices = sd.query_devices()
+            hostapis = sd.query_hostapis()
+            default_input, default_output = sd.default.device
+        except Exception as exc:
+            self._emit_ui("log", f"Audio diagnostics unavailable: {exc}")
+            return
+
+        self._emit_ui("log", "Audio device diagnostics:")
+        if self.cfg.output_mode == "virtual_cable":
+            self._emit_ui("log", "Browser microphone should be: CABLE Output (VB-Audio Virtual Cable)")
+        else:
+            self._emit_ui("log", "Browser microphone should stay on your normal microphone because app output mode is speakers.")
+
+        if self.cfg.output_device_name:
+            self._emit_ui("log", f'Configured output device name: "{self.cfg.output_device_name}"')
+        if self.cfg.input_device_name:
+            self._emit_ui("log", f'Configured input device name: "{self.cfg.input_device_name}"')
+
+        loopback_name = str(self.loopback_speaker_name or "").strip().lower()
+        selected_output_name = self.output_device_name_resolved.strip().lower()
+
+        for idx, dev in enumerate(devices):
+            input_channels = int(dev.get("max_input_channels", 0) or 0)
+            output_channels = int(dev.get("max_output_channels", 0) or 0)
+            if input_channels < 1 and output_channels < 1:
+                continue
+
+            name = str(dev.get("name", "")).strip()
+            lowered_name = name.lower()
+            markers: List[str] = []
+
+            if idx == default_input:
+                markers.append("default-in")
+            if idx == default_output:
+                markers.append("default-out")
+            if self.output_device is not None and idx == self.output_device:
+                markers.append("tts-out")
+            if self.cfg.output_device_name and lowered_name == self.cfg.output_device_name.lower():
+                markers.append("configured-out")
+            if self.cfg.input_mode == "microphone" and self.input_device is not None and idx == self.input_device:
+                markers.append("capture-in")
+            if self.cfg.input_device_name and lowered_name == self.cfg.input_device_name.lower():
+                markers.append("configured-in")
+            if looks_like_virtual_cable_device(name):
+                markers.append("vb-cable")
+            if loopback_name and (lowered_name in loopback_name or loopback_name in lowered_name):
+                markers.append("loopback-target")
+            if selected_output_name and lowered_name == selected_output_name:
+                markers.append("resolved-out")
+            if "cable output" in lowered_name:
+                markers.append("browser-mic")
+
+            marker_text = f" [{' | '.join(markers)}]" if markers else ""
+            self._emit_ui("log", f"  - {describe_audio_device(idx, dev, hostapis)}{marker_text}")
 
     def _emit_ui(self, kind: str, text: str) -> None:
         self.ui_queue.put((kind, text))
@@ -1103,11 +1292,14 @@ class InterviewAgent:
     def start(self) -> None:
         self._emit_ui("status", "Listening...")
         self._emit_ui("log", f"Input mode: {self.cfg.input_mode}, output mode: {self.cfg.output_mode}")
+        self._emit_ui("log", f"Loopback capture source: {self.input_source_label}")
         self._emit_ui("log", f"Default loopback speaker: {self.loopback_speaker_name or 'n/a'}")
         self._emit_ui(
             "log",
-            f"Selected output device: {self.output_device if self.output_device is not None else 'default speakers'}",
+            f"TTS playback device: {self.output_device_label}",
         )
+        self._emit_audio_device_diagnostics()
+        self._emit_routing_guidance()
         if self.capture_own_output_risk:
             self._emit_ui(
                 "log",

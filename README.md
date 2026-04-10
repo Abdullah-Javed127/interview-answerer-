@@ -71,12 +71,16 @@ Notes:
    - Speaker: your normal headphones/speakers
 3. In app config/UI:
    - `output_mode`: `virtual_cable`
+   - `output_device_name`: the exact `CABLE Input ...` device if auto-detect picks the wrong endpoint
    - `input_mode`: `system_audio` (default)
+4. Do not set Meet/Zoom speaker output to VB-Cable. The app listens to your normal playback path and separately speaks into the virtual cable for the browser mic.
 
 ## Troubleshooting
 - Dependency issues: run `install.bat` again.
 - No output in meeting app:
   - Verify meeting microphone points to VB-Cable output.
+  - Verify app log says `TTS playback device:` with a VB-Cable endpoint, not `default speakers`.
+  - Check the startup `Audio device diagnostics:` block and confirm the device tagged `browser-mic` is what Meet/Zoom is using.
   - Temporarily switch app `output_mode` to `speakers` to verify TTS works.
 - App not capturing interviewer audio:
   - Ensure interviewer sound is on your default Windows playback device.
