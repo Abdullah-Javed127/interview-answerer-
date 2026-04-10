@@ -320,6 +320,17 @@ def choose_best_virtual_cable_output() -> Tuple[Optional[int], str, str]:
     return idx, raw_name, label
 
 
+def resample_audio_mono(audio: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+    if src_rate <= 0 or dst_rate <= 0 or src_rate == dst_rate or audio.size == 0:
+        return audio
+    src_positions = np.arange(audio.shape[0], dtype=np.float64)
+    duration = audio.shape[0] / float(src_rate)
+    target_length = max(1, int(round(duration * dst_rate)))
+    dst_positions = np.linspace(0, max(audio.shape[0] - 1, 0), num=target_length, dtype=np.float64)
+    resampled = np.interp(dst_positions, src_positions, audio.astype(np.float64))
+    return resampled.astype(np.float32, copy=False)
+
+
 def default_config_raw() -> Dict[str, Any]:
     return {
         "groq_api_key": "",
@@ -1264,13 +1275,7 @@ class InterviewAgent:
         playback_data = data if data.ndim == 1 else data[:, 0]
         if playback_data.size == 0:
             return
-        stream = sd.OutputStream(
-            samplerate=sample_rate,
-            channels=1,
-            dtype="float32",
-            device=self.output_device,
-            blocksize=OUTPUT_CHUNK_SAMPLES,
-        )
+        stream, playback_data, sample_rate = self._open_output_stream(playback_data, int(sample_rate))
         try:
             stream.start()
             cursor = 0
@@ -1288,6 +1293,52 @@ class InterviewAgent:
                 stream.close()
             except Exception:
                 pass
+
+    def _get_output_device_default_samplerate(self) -> Optional[int]:
+        try:
+            device_info = sd.query_devices(self.output_device, "output")
+        except Exception:
+            return None
+        try:
+            default_rate = int(round(float(device_info.get("default_samplerate", 0) or 0)))
+        except Exception:
+            return None
+        return default_rate if default_rate > 0 else None
+
+    def _open_output_stream(
+        self, playback_data: np.ndarray, sample_rate: int
+    ) -> Tuple[sd.OutputStream, np.ndarray, int]:
+        try:
+            stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=1,
+                dtype="float32",
+                device=self.output_device,
+                blocksize=OUTPUT_CHUNK_SAMPLES,
+            )
+            return stream, playback_data, sample_rate
+        except sd.PortAudioError as exc:
+            message = str(exc).lower()
+            if "invalid sample rate" not in message:
+                raise
+
+            fallback_rate = self._get_output_device_default_samplerate()
+            if not fallback_rate or fallback_rate == sample_rate:
+                raise
+
+            self._emit_ui(
+                "log",
+                f"Playback sample rate {sample_rate} Hz was rejected by {self.output_device_label}; retrying at {fallback_rate} Hz.",
+            )
+            resampled = resample_audio_mono(playback_data, sample_rate, fallback_rate)
+            stream = sd.OutputStream(
+                samplerate=fallback_rate,
+                channels=1,
+                dtype="float32",
+                device=self.output_device,
+                blocksize=OUTPUT_CHUNK_SAMPLES,
+            )
+            return stream, resampled, fallback_rate
 
     def start(self) -> None:
         self._emit_ui("status", "Listening...")
@@ -1748,13 +1799,7 @@ class InterviewAgent:
         self.is_speaking.set()
 
         interrupted = False
-        stream = sd.OutputStream(
-            samplerate=sample_rate,
-            channels=1,
-            dtype="float32",
-            device=self.output_device,
-            blocksize=OUTPUT_CHUNK_SAMPLES,
-        )
+        stream, playback_data, sample_rate = self._open_output_stream(playback_data, int(sample_rate))
         try:
             stream.start()
             cursor = 0
